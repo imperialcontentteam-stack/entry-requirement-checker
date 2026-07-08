@@ -29,9 +29,13 @@ Run:    streamlit run app.py
 import hashlib
 import io
 import json
+import os
 import re
+import shutil
 import sqlite3
+import tempfile
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import requests
@@ -42,7 +46,50 @@ from bs4 import BeautifulSoup
 #  CONSTANTS
 # ═══════════════════════════════════════════════════════════════════
 
-DB_PATH = "er_checker.db"
+APP_DIR = Path(__file__).resolve().parent
+DB_NAME = "er_checker.db"
+
+
+def _writable_db_path() -> str:
+    """Return a path where SQLite can actually write.
+
+    On hosted platforms (e.g. Streamlit Community Cloud) the deployed
+    repo folder — and any er_checker.db committed to it — can be
+    read-only, which causes 'attempt to write a readonly database'.
+    Try the app folder first, then fall back to the user's home dir and
+    the system temp dir. If a bundled (read-only) database exists in
+    the repo, seed the writable copy from it so existing data carries
+    over. SQLite also needs to create journal files, so both the
+    directory and the file must be writable."""
+    bundled = APP_DIR / DB_NAME
+    for d in (APP_DIR, Path.home() / ".er_checker",
+              Path(tempfile.gettempdir()) / "er_checker"):
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            probe = d / ".write_test"
+            probe.write_text("x")
+            probe.unlink()
+        except OSError:
+            continue  # directory not writable → journal files would fail
+        p = d / DB_NAME
+        if p.exists() and not os.access(p, os.W_OK):
+            try:
+                os.chmod(p, 0o664)          # a committed file may be mode 444
+            except OSError:
+                pass
+        if p.exists() and not os.access(p, os.W_OK):
+            continue                        # still read-only → next location
+        if not p.exists() and bundled.exists() and p != bundled:
+            try:
+                shutil.copy(bundled, p)     # carry over bundled data
+                os.chmod(p, 0o664)
+            except OSError:
+                pass
+        return str(p)
+    return str(bundled)                     # last resort
+
+
+DB_PATH = _writable_db_path()
 DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
 
 USER_AGENT = {
