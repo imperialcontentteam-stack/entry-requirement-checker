@@ -706,7 +706,6 @@ def get_or_build_formatted(spec_url: str, qual_name: str, spec_entry: str) -> st
     return formatted
 
 
->>>>>>> 0c8699f6561e7bebb39b57d87f1f594b18edb8fa
 # ═══════════════════════════════════════════════════════════════════
 #  SPEC PROCESSING (once per unique document)
 # ═══════════════════════════════════════════════════════════════════
@@ -820,8 +819,7 @@ def build_pdf(course, report) -> bytes:
 
     corrected = strip_excluded_sections(
         (report["corrected"] or "").strip()
-        or build_corrected_entry(report["spec_entry"], report["corrected"])
->>>>>>> 0c8699f6561e7bebb39b57d87f1f594b18edb8fa
+        or build_corrected_entry(report["spec_entry"], ""))
     story += [Paragraph("Suggested Corrected Entry Requirements "
                         "(complete set from the qualification specification)", h2),
               Paragraph(esc(corrected) or "—", body)]
@@ -1112,7 +1110,6 @@ elif page == "▶️ Run Check":
             (report["corrected"] or "").strip()
             or build_corrected_entry(report["spec_entry"], ""))
         st.markdown(corrected_txt or "—")
->>>>>>> 0c8699f6561e7bebb39b57d87f1f594b18edb8fa
 
         pdf = build_pdf(course, report)
         st.download_button("⬇️ Download Report (PDF)", data=pdf,
