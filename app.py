@@ -116,6 +116,12 @@ def init_db():
         FOREIGN KEY (course_id) REFERENCES courses(id) ON DELETE CASCADE
     );
     """)
+    # migration: cache for the formatted (point-by-point, categorised)
+    # version of each spec's entry requirements
+    try:
+        c.execute("ALTER TABLE specs ADD COLUMN entry_req_formatted TEXT")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     c.commit()
 
 
@@ -511,7 +517,7 @@ Identify:
 3. Incorrect requirements — present on the course page but wrong or absent per the specification (e.g. wrong age, wrong grades, wrong test scores).
 4. Wording differences that change the meaning (e.g. "must" vs "recommended", "and" vs "or").
 5. Grammar and spelling issues on the course page.
-6. A suggested corrected Entry Requirements text for the course page (clean, student-facing wording faithful to the specification; keep it concise).
+6. Suggested corrected Entry Requirements for the course page. This MUST be the COMPLETE set of entry requirements from the QUALIFICATION SPECIFICATION: list EVERY requirement point by point (one per line, each line starting with "- "), using the specification's wording exactly as written. Do NOT summarise, shorten, merge or omit ANY requirement from the specification.
 
 Minor stylistic rephrasing that does NOT change meaning is acceptable and should NOT cause a fail. Fail only for missing requirements, incorrect requirements, or meaning-changing wording. Grammar/spelling issues alone do not fail a course, but list them.
 
@@ -525,7 +531,7 @@ Reply with EXACTLY this JSON:
   "wording_differences": ["..."],
   "grammar_spelling": ["..."],
   "summary": "1-3 sentence overall verdict",
-  "corrected_entry_requirements": "..."
+  "corrected_entry_requirements": "- requirement 1\\n- requirement 2\\n- ... (every requirement from the specification, verbatim, none omitted)"
 }}
 
 COURSE PAGE ENTRY REQUIREMENTS:
@@ -547,6 +553,127 @@ def ai_compare(name: str, page: str, spec: str, excel: str) -> dict:
         excel=excel.strip() or "(not provided)",
     )
     return parse_json_reply(call_ai(prompt, AI_COMPARE_SYSTEM))
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  SUGGESTED CORRECTED ENTRY REQUIREMENTS
+# ═══════════════════════════════════════════════════════════════════
+# The suggested output must be the COMPLETE set of entry requirements
+# from the qualification specification, listed point by point with the
+# specification's wording preserved verbatim. It is therefore built
+# deterministically from the cached spec extraction rather than from
+# the AI's (potentially summarised) suggestion — the AI text is only
+# used as a fallback when no specification is available.
+
+_BULLET_MARK = re.compile(
+    r"^\s*(?:[-–—•▪●○◦*]|\d{1,2}[.)]|[a-zA-Z][.)]|o(?=\s))\s*")
+
+
+def spec_to_points(spec: str) -> str:
+    """Format the specification's Entry Requirements as a point-by-point
+    list ('- ' per line), keeping every requirement and its exact wording.
+    Only layout is normalised: PDF line-wrapping is re-joined and bullet
+    glyphs are unified — no words are added, changed or removed."""
+    text = (spec or "").strip()
+    if not text:
+        return ""
+
+    # 1) merge PDF/DOCX line-wrapping back into logical lines: a line
+    #    continues the previous one unless it starts with a bullet/number
+    #    marker or the previous line already ended a sentence/clause.
+    logical = []
+    for raw in text.split("\n"):
+        line = raw.strip()
+        if not line:
+            continue
+        starts_new = bool(_BULLET_MARK.match(line))
+        if logical and not starts_new and not re.search(r"[.:;!?]$", logical[-1]):
+            logical[-1] += " " + line
+        else:
+            logical.append(line)
+
+    # 2) strip the bullet glyph/number — the wording itself is untouched
+    points = [p for p in (_BULLET_MARK.sub("", ln).strip() for ln in logical) if p]
+
+    # 3) a single unbroken prose block still needs to read point by point:
+    #    split on sentence boundaries (wording remains verbatim)
+    if len(points) == 1 and len(points[0]) > 200:
+        points = [s.strip() for s in
+                  re.split(r"(?<=[.;])\s+(?=[A-Z(])", points[0]) if s.strip()]
+
+    return "\n".join(f"- {p}" for p in points)
+
+
+def build_corrected_entry(spec_entry: str, ai_corrected: str) -> str:
+    """The suggested corrected Entry Requirements shown to the user.
+    Specification available → the full spec list (nothing omitted).
+    No specification → fall back to the AI suggestion."""
+    if (spec_entry or "").strip():
+        return spec_to_points(spec_entry)
+    return (ai_corrected or "").strip()
+
+
+# ── AI formatting into the categorised, point-by-point layout ────────
+
+AI_FORMAT_SYSTEM = (
+    "You format the Entry Requirements of UK qualification specifications. "
+    "Reply ONLY with the formatted text — no JSON, no code fences, no commentary "
+    "before or after."
+)
+
+AI_FORMAT_PROMPT = """Reformat the ENTRY REQUIREMENTS below into the exact layout of this example (structure and style only — the CONTENT must come solely from the text provided):
+
+Based on the provided document, the entry requirements for the {name} are as follows:
+
+* Age Requirement: These qualifications are designed for learners who are typically aged 16+.
+* General Access Policy: ATHE's policy ensures that the qualifications should be available to everyone capable of reaching the required standards, free from barriers to access and progression, and with equal opportunities for all.
+* Typical Entry Profile for Recent Learners: For learners who have recently been in education or training, the entry profile is likely to include one of the following:
+    * 5 or more GCSEs at grades 4 and above
+    * Other related level 2 subjects
+* English Language Proficiency: Learners must have an appropriate standard of English to access resources and complete assignments. For those whose first language is not English, the recommended standards are:
+    * IELTS 5.5
+    * Common European Framework of Reference (CEFR) B2
+
+RULES — follow ALL of them:
+1. Start with exactly: "Based on the provided document, the entry requirements for the {name} are as follows:"
+2. Include EVERY requirement from the source text. Do NOT omit, merge, shorten or summarise anything. Every age limit, qualification, grade, test name, score, policy statement and centre obligation in the source MUST appear in the output.
+3. Keep the specification's wording faithful — you may only add the short category labels (e.g. "Age Requirement:", "English Language Proficiency:") and adjust joining words needed by the layout. Never change numbers, grades, scores or test names.
+4. One "* " bullet per requirement category, starting with a bold-free short label followed by a colon.
+5. Where the source lists alternatives or multiple items (e.g. GCSE options, English tests), put each item on its own nested bullet indented with 4 spaces: "    * item".
+6. Do not invent requirements that are not in the source text.
+
+ENTRY REQUIREMENTS (source text):
+{spec}
+"""
+
+
+def format_spec_entry(qual_name: str, spec_entry: str) -> str:
+    """AI-format the spec's Entry Requirements into the categorised
+    point-by-point layout. Falls back to the deterministic list if the
+    AI reply fails or looks incomplete (guarding against omissions)."""
+    fallback = spec_to_points(spec_entry)
+    try:
+        out = call_ai(AI_FORMAT_PROMPT.format(name=qual_name, spec=spec_entry),
+                      AI_FORMAT_SYSTEM).strip()
+        out = re.sub(r"^```[a-z]*\s*|\s*```$", "", out, flags=re.S).strip()
+        # completeness guard: a faithful reformat of the full spec cannot be
+        # much shorter than the source — if it is, requirements were dropped
+        if out and len(out) >= 0.6 * len(spec_entry.strip()):
+            return out
+    except Exception:
+        pass
+    return fallback
+
+
+def get_or_build_formatted(spec_url: str, qual_name: str, spec_entry: str) -> str:
+    """Formatted spec requirements, cached per specification document."""
+    row = get_spec(spec_url) if spec_url else None
+    if row and row.get("entry_req_formatted"):
+        return row["entry_req_formatted"]
+    formatted = format_spec_entry(qual_name, spec_entry)
+    if row and formatted:
+        save_spec(spec_url, entry_req_formatted=formatted)
+    return formatted
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -581,7 +708,7 @@ def process_spec(url: str, force: bool = False, use_ai_fallback: bool = True) ->
         if not entry:
             raise RuntimeError("Entry Requirements section not found in the document.")
         save_spec(url, doc_hash=doc_hash, entry_req=entry, status="ok",
-                  error="", extracted_at=now())
+                  error="", extracted_at=now(), entry_req_formatted="")
         return {"skipped": False, "status": "ok"}
     except Exception as e:
         save_spec(url, status="error", error=str(e)[:500], extracted_at=now())
@@ -660,8 +787,11 @@ def build_pdf(course, report) -> bytes:
     issue_block("Wording Differences (meaning-changing)", "wording_differences")
     issue_block("Grammar & Spelling Issues", "grammar_spelling")
 
-    story += [Paragraph("Suggested Corrected Entry Requirements", h2),
-              Paragraph(esc(report["corrected"]) or "—", body)]
+    corrected = (report["corrected"] or "").strip() \
+        or build_corrected_entry(report["spec_entry"], "")
+    story += [Paragraph("Suggested Corrected Entry Requirements "
+                        "(complete set from the qualification specification)", h2),
+              Paragraph(esc(corrected) or "—", body)]
 
     doc.build(story)
     return buf.getvalue()
@@ -814,7 +944,7 @@ if page == "📥 Upload & Specs":
                 b1, b2 = st.columns(2)
                 if b1.button("Save edits", key=f"save_{s['id']}"):
                     save_spec(s["url"], entry_req=edited, status="ok", error="",
-                              extracted_at=now())
+                              extracted_at=now(), entry_req_formatted="")
                     st.success("Saved.")
                 if b2.button("Force re-extract", key=f"re_{s['id']}"):
                     with st.spinner("Re-extracting…"):
@@ -883,13 +1013,17 @@ elif page == "▶️ Run Check":
                     else:
                         st.warning("Specification could not be extracted: "
                                    f"{spec_row['error'] if spec_row else 'unknown error'}")
-            with st.spinner("3/3 Comparing with AI…"):
+            with st.spinner("3/3 Comparing & formatting with AI…"):
                 verdict = ai_compare(course["name"], page_entry, spec_entry,
                                      course["excel_entry"] or "")
+                if spec_entry.strip():
+                    corrected = get_or_build_formatted(
+                        course["spec_url"], course["name"], spec_entry)
+                else:
+                    corrected = verdict.get("corrected_entry_requirements", "")
             result = "Pass" if str(verdict.get("result", "")).lower() == "pass" else "Fail"
             save_report(course["id"], result, page_entry, spec_entry,
-                        course["excel_entry"] or "", verdict,
-                        verdict.get("corrected_entry_requirements", ""))
+                        course["excel_entry"] or "", verdict, corrected)
             st.success("Check complete.")
         except Exception as e:
             st.error(f"Check failed: {e}")
@@ -938,7 +1072,12 @@ elif page == "▶️ Run Check":
             show_issues("Grammar & Spelling", "grammar_spelling", AMBER)
 
         st.markdown("**Suggested Corrected Entry Requirements**")
-        st.info(report["corrected"] or "—")
+        st.caption("Complete set of entry requirements from the qualification "
+                   "specification, point by point — compare directly with the "
+                   "course page requirements above.")
+        corrected_txt = (report["corrected"] or "").strip() \
+            or build_corrected_entry(report["spec_entry"], "")
+        st.markdown(corrected_txt or "—")
 
         pdf = build_pdf(course, report)
         st.download_button("⬇️ Download Report (PDF)", data=pdf,
