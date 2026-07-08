@@ -446,10 +446,30 @@ def extract_page_entry(url: str) -> tuple:
 #  AI (OpenRouter)
 # ═══════════════════════════════════════════════════════════════════
 
+# US-based OpenRouter providers that host DeepSeek models. When the
+# "US-hosted providers only" setting is on, requests are routed to these
+# hosts and never to DeepSeek's own (China-based) first-party API.
+US_PROVIDER_ORDER = ["fireworks", "together", "deepinfra"]
+
+
 def call_ai(prompt: str, system: str, temperature: float = 0.0) -> str:
     api_key = setting("api_key")
     if not api_key:
         raise RuntimeError("No OpenRouter API key set — add it in the sidebar.")
+    payload = {
+        "model": setting("model", DEFAULT_MODEL),
+        "temperature": temperature,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
+    }
+    if setting("us_only", "1") == "1":
+        payload["provider"] = {
+            "order": US_PROVIDER_ORDER,      # prefer these US hosts, in order
+            "ignore": ["deepseek"],          # never DeepSeek's own API
+            "allow_fallbacks": True,         # other OpenRouter hosts as backup
+        }
     resp = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers={
@@ -458,14 +478,7 @@ def call_ai(prompt: str, system: str, temperature: float = 0.0) -> str:
             "HTTP-Referer": "http://localhost:8501",
             "X-Title": "Entry Requirements Checker",
         },
-        json={
-            "model": setting("model", DEFAULT_MODEL),
-            "temperature": temperature,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt},
-            ],
-        },
+        json=payload,
         timeout=180,
     )
     resp.raise_for_status()
@@ -894,9 +907,15 @@ with st.sidebar.expander("⚙️ AI Settings", expanded=not setting("api_key")):
     key_in = st.text_input("OpenRouter API key", value=setting("api_key"),
                            type="password")
     model_in = st.text_input("Model", value=setting("model", DEFAULT_MODEL))
+    us_in = st.checkbox("US-hosted providers only",
+                        value=setting("us_only", "1") == "1",
+                        help="Route DeepSeek requests to US hosts "
+                             "(Fireworks, Together, DeepInfra) and never to "
+                             "DeepSeek's own API.")
     if st.button("Save settings"):
         set_setting("api_key", key_in.strip())
         set_setting("model", model_in.strip() or DEFAULT_MODEL)
+        set_setting("us_only", "1" if us_in else "0")
         st.success("Saved.")
 
 
