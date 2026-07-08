@@ -671,7 +671,6 @@ def strip_excluded_sections(text: str) -> str:
     # tidy runs of blank lines left behind
     return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
 
-
 def format_spec_entry(qual_name: str, spec_entry: str) -> str:
     """AI-format the spec's Entry Requirements into the categorised
     point-by-point layout. Falls back to the deterministic list if the
@@ -706,6 +705,7 @@ def get_or_build_formatted(spec_url: str, qual_name: str, spec_entry: str) -> st
     return formatted
 
 
+>>>>>>> 6f048a420bdf75e638c91685dac83a185f7490d9
 # ═══════════════════════════════════════════════════════════════════
 #  SPEC PROCESSING (once per unique document)
 # ═══════════════════════════════════════════════════════════════════
@@ -819,7 +819,8 @@ def build_pdf(course, report) -> bytes:
 
     corrected = strip_excluded_sections(
         (report["corrected"] or "").strip()
-        or build_corrected_entry(report["spec_entry"], ""))
+        or build_corrected_entry(report["spec_entry"], report["corrected"]))
+>>>>>>> 6f048a420bdf75e638c91685dac83a185f7490d9
     story += [Paragraph("Suggested Corrected Entry Requirements "
                         "(complete set from the qualification specification)", h2),
               Paragraph(esc(corrected) or "—", body)]
@@ -1053,6 +1054,8 @@ elif page == "▶️ Run Check":
                 else:
                     corrected = verdict.get("corrected_entry_requirements", "")
             result = "Pass" if str(verdict.get("result", "")).lower() == "pass" else "Fail"
+            corrected = build_corrected_entry(
+                spec_entry, verdict.get("corrected_entry_requirements", ""))
             save_report(course["id"], result, page_entry, spec_entry,
                         course["excel_entry"] or "", verdict, corrected)
             st.success("Check complete.")
@@ -1108,8 +1111,9 @@ elif page == "▶️ Run Check":
                    "course page requirements above.")
         corrected_txt = strip_excluded_sections(
             (report["corrected"] or "").strip()
-            or build_corrected_entry(report["spec_entry"], ""))
+            or build_corrected_entry(report["spec_entry"], report["corrected"]))
         st.markdown(corrected_txt or "—")
+>>>>>>> 6f048a420bdf75e638c91685dac83a185f7490d9
 
         pdf = build_pdf(course, report)
         st.download_button("⬇️ Download Report (PDF)", data=pdf,
