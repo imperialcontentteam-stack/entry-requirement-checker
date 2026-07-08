@@ -511,7 +511,7 @@ Identify:
 3. Incorrect requirements — present on the course page but wrong or absent per the specification (e.g. wrong age, wrong grades, wrong test scores).
 4. Wording differences that change the meaning (e.g. "must" vs "recommended", "and" vs "or").
 5. Grammar and spelling issues on the course page.
-6. A suggested corrected Entry Requirements text for the course page (clean, student-facing wording faithful to the specification; keep it concise).
+6. Suggested corrected Entry Requirements for the course page. This MUST be the COMPLETE set of entry requirements from the QUALIFICATION SPECIFICATION: list EVERY requirement point by point (one per line, each line starting with "- "), using the specification's wording exactly as written. Do NOT summarise, shorten, merge or omit ANY requirement from the specification.
 
 Minor stylistic rephrasing that does NOT change meaning is acceptable and should NOT cause a fail. Fail only for missing requirements, incorrect requirements, or meaning-changing wording. Grammar/spelling issues alone do not fail a course, but list them.
 
@@ -525,7 +525,7 @@ Reply with EXACTLY this JSON:
   "wording_differences": ["..."],
   "grammar_spelling": ["..."],
   "summary": "1-3 sentence overall verdict",
-  "corrected_entry_requirements": "..."
+  "corrected_entry_requirements": "- requirement 1\\n- requirement 2\\n- ... (every requirement from the specification, verbatim, none omitted)"
 }}
 
 COURSE PAGE ENTRY REQUIREMENTS:
@@ -547,6 +547,64 @@ def ai_compare(name: str, page: str, spec: str, excel: str) -> dict:
         excel=excel.strip() or "(not provided)",
     )
     return parse_json_reply(call_ai(prompt, AI_COMPARE_SYSTEM))
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  SUGGESTED CORRECTED ENTRY REQUIREMENTS
+# ═══════════════════════════════════════════════════════════════════
+# The suggested output must be the COMPLETE set of entry requirements
+# from the qualification specification, listed point by point with the
+# specification's wording preserved verbatim. It is therefore built
+# deterministically from the cached spec extraction rather than from
+# the AI's (potentially summarised) suggestion — the AI text is only
+# used as a fallback when no specification is available.
+
+_BULLET_MARK = re.compile(
+    r"^\s*(?:[-–—•▪●○◦*]|\d{1,2}[.)]|[a-zA-Z][.)]|o(?=\s))\s*")
+
+
+def spec_to_points(spec: str) -> str:
+    """Format the specification's Entry Requirements as a point-by-point
+    list ('- ' per line), keeping every requirement and its exact wording.
+    Only layout is normalised: PDF line-wrapping is re-joined and bullet
+    glyphs are unified — no words are added, changed or removed."""
+    text = (spec or "").strip()
+    if not text:
+        return ""
+
+    # 1) merge PDF/DOCX line-wrapping back into logical lines: a line
+    #    continues the previous one unless it starts with a bullet/number
+    #    marker or the previous line already ended a sentence/clause.
+    logical = []
+    for raw in text.split("\n"):
+        line = raw.strip()
+        if not line:
+            continue
+        starts_new = bool(_BULLET_MARK.match(line))
+        if logical and not starts_new and not re.search(r"[.:;!?]$", logical[-1]):
+            logical[-1] += " " + line
+        else:
+            logical.append(line)
+
+    # 2) strip the bullet glyph/number — the wording itself is untouched
+    points = [p for p in (_BULLET_MARK.sub("", ln).strip() for ln in logical) if p]
+
+    # 3) a single unbroken prose block still needs to read point by point:
+    #    split on sentence boundaries (wording remains verbatim)
+    if len(points) == 1 and len(points[0]) > 200:
+        points = [s.strip() for s in
+                  re.split(r"(?<=[.;])\s+(?=[A-Z(])", points[0]) if s.strip()]
+
+    return "\n".join(f"- {p}" for p in points)
+
+
+def build_corrected_entry(spec_entry: str, ai_corrected: str) -> str:
+    """The suggested corrected Entry Requirements shown to the user.
+    Specification available → the full spec list (nothing omitted).
+    No specification → fall back to the AI suggestion."""
+    if (spec_entry or "").strip():
+        return spec_to_points(spec_entry)
+    return (ai_corrected or "").strip()
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -660,8 +718,10 @@ def build_pdf(course, report) -> bytes:
     issue_block("Wording Differences (meaning-changing)", "wording_differences")
     issue_block("Grammar & Spelling Issues", "grammar_spelling")
 
-    story += [Paragraph("Suggested Corrected Entry Requirements", h2),
-              Paragraph(esc(report["corrected"]) or "—", body)]
+    corrected = build_corrected_entry(report["spec_entry"], report["corrected"])
+    story += [Paragraph("Suggested Corrected Entry Requirements "
+                        "(complete set from the qualification specification)", h2),
+              Paragraph(esc(corrected) or "—", body)]
 
     doc.build(story)
     return buf.getvalue()
@@ -887,9 +947,10 @@ elif page == "▶️ Run Check":
                 verdict = ai_compare(course["name"], page_entry, spec_entry,
                                      course["excel_entry"] or "")
             result = "Pass" if str(verdict.get("result", "")).lower() == "pass" else "Fail"
+            corrected = build_corrected_entry(
+                spec_entry, verdict.get("corrected_entry_requirements", ""))
             save_report(course["id"], result, page_entry, spec_entry,
-                        course["excel_entry"] or "", verdict,
-                        verdict.get("corrected_entry_requirements", ""))
+                        course["excel_entry"] or "", verdict, corrected)
             st.success("Check complete.")
         except Exception as e:
             st.error(f"Check failed: {e}")
@@ -938,7 +999,11 @@ elif page == "▶️ Run Check":
             show_issues("Grammar & Spelling", "grammar_spelling", AMBER)
 
         st.markdown("**Suggested Corrected Entry Requirements**")
-        st.info(report["corrected"] or "—")
+        st.caption("Complete set of entry requirements from the qualification "
+                   "specification, point by point — compare directly with the "
+                   "course page requirements above.")
+        st.info(build_corrected_entry(report["spec_entry"],
+                                      report["corrected"]) or "—")
 
         pdf = build_pdf(course, report)
         st.download_button("⬇️ Download Report (PDF)", data=pdf,
