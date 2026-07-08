@@ -163,12 +163,23 @@ def init_db():
         FOREIGN KEY (course_id) REFERENCES courses(id) ON DELETE CASCADE
     );
     """)
-    # migration: cache for the formatted (point-by-point, categorised)
-    # version of each spec's entry requirements
-    try:
-        c.execute("ALTER TABLE specs ADD COLUMN entry_req_formatted TEXT")
-    except sqlite3.OperationalError:
-        pass  # column already exists
+    # migrations (ALTER TABLE is a no-op when the column already exists)
+    migrations = (
+        # cache for the formatted (point-by-point, categorised) entry reqs
+        "ALTER TABLE specs ADD COLUMN entry_req_formatted TEXT",
+        # Method of Assessment check
+        "ALTER TABLE specs ADD COLUMN moa TEXT",
+        "ALTER TABLE reports ADD COLUMN page_moa TEXT",
+        "ALTER TABLE reports ADD COLUMN spec_moa TEXT",
+        "ALTER TABLE reports ADD COLUMN moa_issues_json TEXT",
+        "ALTER TABLE reports ADD COLUMN moa_corrected TEXT",
+        "ALTER TABLE reports ADD COLUMN moa_result TEXT",
+    )
+    for m in migrations:
+        try:
+            c.execute(m)
+        except sqlite3.OperationalError:
+            pass  # column already exists
     c.commit()
 
 
@@ -283,14 +294,21 @@ def delete_spec(spec_id: int):
 # ── reports ─────────────────────────────────────────────────────────
 
 def save_report(course_id: int, result: str, page_entry: str, spec_entry: str,
-                excel_entry: str, issues: dict, corrected: str) -> int:
+                excel_entry: str, issues: dict, corrected: str,
+                page_moa: str = "", spec_moa: str = "", moa_issues: dict = None,
+                moa_corrected: str = "", moa_result: str = "") -> int:
     c = get_conn()
     cur = c.execute("""
         INSERT INTO reports (course_id, result, page_entry, spec_entry,
-                             excel_entry, issues_json, corrected, created_at)
-        VALUES (?,?,?,?,?,?,?,?)
+                             excel_entry, issues_json, corrected, created_at,
+                             page_moa, spec_moa, moa_issues_json,
+                             moa_corrected, moa_result)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (course_id, result, page_entry, spec_entry, excel_entry,
-          json.dumps(issues, ensure_ascii=False), corrected, now()))
+          json.dumps(issues, ensure_ascii=False), corrected, now(),
+          page_moa, spec_moa,
+          json.dumps(moa_issues or {}, ensure_ascii=False),
+          moa_corrected, moa_result))
     c.commit()
     return cur.lastrowid
 
@@ -372,6 +390,9 @@ def spec_bytes_to_text(data: bytes, url: str = "", max_chars: int = 150000) -> s
 
 
 ENTRY_HEADING = r"entry\s+requirements?|entry\s+criteria|admission\s+requirements?"
+MOA_HEADING = (r"method(?:s)?\s+of\s+assessment"
+               r"|assessment\s+(?:methods?|approach|overview|strategy|and\s+grading)"
+               r"|how\s+(?:is\s+(?:this|the)\s+course|will\s+I\s+be)\s+assessed")
 
 # Words/phrases that begin the NEXT section of a spec document.
 # NOTE: bare generic words (resources, support, contact, assessment, units…)
@@ -380,9 +401,8 @@ ENTRY_HEADING = r"entry\s+requirements?|entry\s+criteria|admission\s+requirement
 #   "…to enable them to access relevant\nresources and complete the unit assignments."
 # was mistaken for a "Resources" heading and truncated the section, silently
 # dropping everything after it (e.g. the IELTS / CEFR / CAE / PTE list).
-_STOP_WORDS = (
-    r"method(?:s)?\s+of\s+assessment|assessment(?:\s+(?:overview|methods?|and\s+grading|strategy))?"
-    r"|progression(?:\s+(?:opportunities|routes?))?|grading"
+_COMMON_STOPS = (
+    r"progression(?:\s+(?:opportunities|routes?))?|grading"
     r"|units?(?:\s+(?:overview|summary))?|qualification\s+structure|unit\s+structure"
     r"|guided\s+learning(?:\s+hours)?|total\s+qualification\s+time"
     r"|course\s+content|learning\s+outcomes?|funding|centre(?:\s+requirements?)?"
@@ -390,29 +410,45 @@ _STOP_WORDS = (
     r"|resources?(?:\s+required)?|contact(?:\s+us)?"
     r"|reasonable\s+adjustments|recognition\s+of\s+prior(?:\s+learning)?"
 )
-
-# A stop match only counts as a heading when it occupies (almost) the whole
-# line: optional section number before, optional colon after, then end of
-# line. A wrapped sentence continuing after the word will NOT match.
-STOP_HEADINGS = (
-    rf"(?:^|\n)[ \t]*(?:\d+(?:\.\d+)*\.?[ \t]+)?"
-    rf"(?:{_STOP_WORDS})"
-    rf"[ \t]*:?[ \t]*(?=\n|$)"
+# next-section words when extracting ENTRY REQUIREMENTS (assessment ends it)
+_STOP_WORDS = (
+    r"method(?:s)?\s+of\s+assessment"
+    r"|assessment(?:\s+(?:overview|methods?|and\s+grading|strategy))?|"
+    + _COMMON_STOPS
+)
+# next-section words when extracting METHOD OF ASSESSMENT (entry reqs end it)
+_MOA_STOP_WORDS = (
+    rf"{ENTRY_HEADING}|malpractice|certification|results|external\s+verification|"
+    + _COMMON_STOPS
 )
 
 
-def heuristic_entry_section(text: str, max_chars: int = 6000) -> str:
-    """Pull the Entry Requirements section out of a document's text.
+def _stop_re(words: str) -> str:
+    # A stop match only counts as a heading when it occupies (almost) the
+    # whole line: optional section number before, optional colon after, then
+    # end of line. A wrapped sentence continuing after the word will NOT match.
+    return (rf"(?:^|\n)[ \t]*(?:\d+(?:\.\d+)*\.?[ \t]+)?"
+            rf"(?:{words})"
+            rf"[ \t]*:?[ \t]*(?=\n|$)")
+
+
+STOP_HEADINGS = _stop_re(_STOP_WORDS)
+MOA_STOP_HEADINGS = _stop_re(_MOA_STOP_WORDS)
+
+
+def heuristic_section(text: str, heading_re: str, stop_re: str,
+                      max_chars: int = 6000) -> str:
+    """Pull a named section out of a document's text.
     Skips table-of-contents hits (dot leaders / bare page numbers) and,
     when the heading appears more than once, keeps the longest candidate
     (body section) rather than the first (often a passing mention)."""
     if not text:
         return ""
     best = ""
-    for m in re.finditer(rf"(?:^|\n)\s*(?:\d+(?:\.\d+)*\.?\s+)?(?:{ENTRY_HEADING})"
+    for m in re.finditer(rf"(?:^|\n)\s*(?:\d+(?:\.\d+)*\.?\s+)?(?:{heading_re})"
                          rf"\s*:?\s*\n?", text, re.I):
         start = m.end()
-        stop = re.search(STOP_HEADINGS, text[start:], re.I)
+        stop = re.search(stop_re, text[start:], re.I)
         chunk = text[start:start + stop.start()] if stop else text[start:start + max_chars]
         chunk = re.sub(r"\n{3,}", "\n\n", chunk).strip()[:max_chars]
         head = chunk[:80]
@@ -424,69 +460,101 @@ def heuristic_entry_section(text: str, max_chars: int = 6000) -> str:
     return best if len(best) >= 40 else ""
 
 
+def heuristic_entry_section(text: str, max_chars: int = 6000) -> str:
+    return heuristic_section(text, ENTRY_HEADING, STOP_HEADINGS, max_chars)
+
+
+def heuristic_moa_section(text: str, max_chars: int = 6000) -> str:
+    return heuristic_section(text, MOA_HEADING, MOA_STOP_HEADINGS, max_chars)
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  EXTRACTION — course pages
 # ═══════════════════════════════════════════════════════════════════
 
-def extract_page_entry(url: str) -> tuple:
-    """Return (entry_requirements_text, full_page_text). The heading-based
-    extraction handles the usual course-page layout; if it fails the caller
-    can fall back to sending full_page_text to the AI."""
+# headings that mark the NEXT section on a course page (used to stop reading)
+_PAGE_NEXT = (r"course (?:content|curriculum)|qualification|awarding body"
+              r"|career path|who is this|certification|progression|why study"
+              r"|faq|average completion|not sure if this course"
+              r"|speak to an advisor|study method|course duration")
+PAGE_NEXT_AFTER_ENTRY = rf"method(?:s)? of assessment|assessment|{_PAGE_NEXT}"
+PAGE_NEXT_AFTER_MOA = rf"entry requirements?|entry criteria|{_PAGE_NEXT}"
+
+# trailing marketing boilerplate to trim from any extracted page section
+_PAGE_BOILERPLATE = (r"not sure if this course|speak to an advisor"
+                     r"|average completion timeframe|\b0\d{2}[- ]\d{4}[- ]\d{4}\b")
+
+
+def _page_section(soup, heading_re: str, next_re: str) -> str:
+    """Find a section on a course page by its heading and collect the
+    content that follows it (handles accordion/tab layouts)."""
+    heading = None
+    for h in soup.find_all(["h1", "h2", "h3", "h4", "h5", "strong", "b",
+                            "button", "a", "span", "div"]):
+        t = h.get_text(" ", strip=True)
+        if t and len(t) < 60 and re.fullmatch(rf"(?:{heading_re})\s*:?", t, re.I):
+            heading = h
+            break
+    if heading is None:
+        return ""
+    parts = []
+    node = heading
+    for _ in range(12):
+        node = node.find_next_sibling()
+        if node is None:
+            break
+        t = node.get_text("\n", strip=True)
+        if not t:
+            continue
+        # stop at the next section heading / trailing boilerplate
+        if re.match(rf"(?:{next_re})", t, re.I) and len(t) < 90:
+            break
+        parts.append(t)
+        if sum(len(p) for p in parts) > 3500:
+            break
+    section = "\n".join(parts).strip()
+    if not section:  # content nested inside the parent (accordion item)
+        parent = heading.find_parent()
+        if parent is not None:
+            t = parent.get_text("\n", strip=True)
+            t = re.sub(rf"^\s*(?:{heading_re})\s*:?\s*", "", t, flags=re.I)
+            section = t.strip()[:4000]
+    return section
+
+
+def _trim_boilerplate(text: str) -> str:
+    return re.split(_PAGE_BOILERPLATE, text or "", flags=re.I)[0].strip()[:4000]
+
+
+def extract_page_sections(url: str) -> tuple:
+    """Return (entry_requirements, method_of_assessment, full_page_text)
+    from a course page, fetched once. Heading-based extraction handles the
+    usual layouts; when it fails, a heuristic runs on the flattened text,
+    and the caller can still fall back to sending full_page_text to the AI."""
     resp = requests.get(url, headers=USER_AGENT, timeout=60, allow_redirects=True)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
     for tag in soup(["script", "style", "nav", "footer", "header", "noscript", "form"]):
         tag.decompose()
 
-    # 1) find a heading whose text is (close to) "Entry Requirements"
-    heading = None
-    for h in soup.find_all(["h1", "h2", "h3", "h4", "h5", "strong", "b",
-                            "button", "a", "span", "div"]):
-        t = h.get_text(" ", strip=True)
-        if t and len(t) < 60 and re.fullmatch(rf"(?:{ENTRY_HEADING})\s*:?", t, re.I):
-            heading = h
-            break
-
-    entry = ""
-    if heading is not None:
-        # accordion/tab layouts: content often lives in the next sibling block
-        parts = []
-        node = heading
-        for _ in range(12):
-            node = node.find_next_sibling()
-            if node is None:
-                break
-            t = node.get_text("\n", strip=True)
-            if not t:
-                continue
-            # stop at the next section heading / trailing boilerplate
-            if re.match(r"(method(?:s)? of assessment|assessment|course (?:content|curriculum)"
-                        r"|qualification|awarding body|career path|who is this|certification"
-                        r"|progression|why study|faq|average completion"
-                        r"|not sure if this course|speak to an advisor)", t, re.I) and len(t) < 90:
-                break
-            parts.append(t)
-            if sum(len(p) for p in parts) > 3500:
-                break
-        entry = "\n".join(parts).strip()
-        if not entry:  # content nested inside the parent (accordion item)
-            parent = heading.find_parent()
-            if parent is not None:
-                t = parent.get_text("\n", strip=True)
-                t = re.sub(rf"^\s*(?:{ENTRY_HEADING})\s*:?\s*", "", t, flags=re.I)
-                entry = t.strip()[:4000]
+    entry = _page_section(soup, ENTRY_HEADING, PAGE_NEXT_AFTER_ENTRY)
+    moa = _page_section(soup, MOA_HEADING, PAGE_NEXT_AFTER_MOA)
 
     main = soup.find("main") or soup.find("article") or soup.body or soup
     full_text = re.sub(r"\n{3,}", "\n\n", main.get_text("\n", strip=True))[:14000]
 
-    if not entry:  # 2) heuristic on the flattened page text
+    if not entry:
         entry = heuristic_entry_section(full_text)
+    if not moa:
+        moa = heuristic_moa_section(full_text)
 
-    # trim marketing boilerplate that trails the requirements list
-    entry = re.split(r"not sure if this course|speak to an advisor"
-                     r"|average completion timeframe|\b0\d{2}[- ]\d{4}[- ]\d{4}\b",
-                     entry, flags=re.I)[0].strip()
-    return entry[:4000], full_text
+    return _trim_boilerplate(entry), _trim_boilerplate(moa), full_text
+
+
+def extract_page_entry(url: str) -> tuple:
+    """Backward-compatible wrapper: (entry_requirements_text, full_page_text)."""
+    entry, _, full_text = extract_page_sections(url)
+    return entry, full_text
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -546,18 +614,31 @@ def parse_json_reply(raw: str) -> dict:
 AI_EXTRACT_SYSTEM = ("You extract sections from documents. "
                      "Reply ONLY with valid JSON — no markdown, no commentary.")
 
-AI_EXTRACT_PROMPT = """From the text below, extract the ENTRY REQUIREMENTS section verbatim (fix broken line-wrapping but do not reword). If it is genuinely absent, use an empty string.
+AI_EXTRACT_PROMPT = """From the text below, extract the {section} section verbatim (fix broken line-wrapping but do not reword). If it is genuinely absent, use an empty string.
 
-Reply with EXACTLY this JSON: {{"entry_requirements": "..."}}
+Reply with EXACTLY this JSON: {{"{key}": "..."}}
 
 TEXT:
 {text}
 """
 
 
+def ai_extract_section(text: str, section: str, key: str) -> str:
+    raw = call_ai(AI_EXTRACT_PROMPT.format(section=section, key=key,
+                                           text=text[:14000]),
+                  AI_EXTRACT_SYSTEM)
+    return parse_json_reply(raw).get(key, "").strip()
+
+
 def ai_extract_entry(text: str) -> str:
-    raw = call_ai(AI_EXTRACT_PROMPT.format(text=text[:14000]), AI_EXTRACT_SYSTEM)
-    return parse_json_reply(raw).get("entry_requirements", "").strip()
+    return ai_extract_section(text, "ENTRY REQUIREMENTS", "entry_requirements")
+
+
+def ai_extract_moa(text: str) -> str:
+    return ai_extract_section(text, "METHOD OF ASSESSMENT (how learners are "
+                              "assessed: assignments, exams, coursework, "
+                              "internal/external assessment, grading approach)",
+                              "method_of_assessment")
 
 
 AI_COMPARE_SYSTEM = (
@@ -613,6 +694,110 @@ def ai_compare(name: str, page: str, spec: str, excel: str) -> dict:
         excel=excel.strip() or "(not provided)",
     )
     return parse_json_reply(call_ai(prompt, AI_COMPARE_SYSTEM))
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  METHOD OF ASSESSMENT — compare & suggested corrected version
+# ═══════════════════════════════════════════════════════════════════
+
+AI_MOA_COMPARE_SYSTEM = (
+    "You are a meticulous quality auditor for a UK college. You compare a course "
+    "page's Method of Assessment against the awarding body's Qualification "
+    "Specification. Reply ONLY with valid JSON — no markdown fences, no commentary."
+)
+
+AI_MOA_COMPARE_PROMPT = """Course: "{name}"
+
+Compare the Method of Assessment from the two sources below. The QUALIFICATION SPECIFICATION is the authoritative source of truth; the COURSE PAGE is what students see and must faithfully reflect the specification.
+
+Identify:
+1. Missing assessment methods — present in the specification but absent from the course page.
+2. Incorrect wording — statements on the course page that contradict or misstate the specification (e.g. wrong assessment type, wrong grading, "exam" when the spec says "assignments").
+3. Additional information — content on the course page that is NOT found in the specification.
+4. Grammar and formatting issues on the course page (spelling, punctuation, capitalisation, broken formatting).
+5. Whether the course page wording is "identical", "similar", or "different" compared with the specification.
+6. A clear overall verdict: what should be changed on the course page.
+
+Minor stylistic rephrasing that does NOT change meaning is acceptable and should NOT cause a fail. Fail only for missing assessment methods, incorrect/contradicting statements, or additional information that misrepresents the specification.
+
+Reply with EXACTLY this JSON:
+{{
+  "result": "Pass" or "Fail",
+  "wording_match": "identical" or "similar" or "different",
+  "missing_methods": ["..."],
+  "incorrect_wording": ["..."],
+  "additional_information": ["..."],
+  "grammar_formatting": ["..."],
+  "summary": "1-3 sentence overall verdict describing what should be changed"
+}}
+
+COURSE PAGE METHOD OF ASSESSMENT:
+{page}
+
+QUALIFICATION SPECIFICATION METHOD OF ASSESSMENT:
+{spec}
+"""
+
+
+def ai_compare_moa(name: str, page: str, spec: str) -> dict:
+    prompt = AI_MOA_COMPARE_PROMPT.format(
+        name=name,
+        page=page.strip() or "(not found on the course page)",
+        spec=spec.strip() or "(not available)",
+    )
+    return parse_json_reply(call_ai(prompt, AI_MOA_COMPARE_SYSTEM))
+
+
+AI_MOA_CORRECT_SYSTEM = (
+    "You produce publish-ready course page copy for a UK college. "
+    "Reply ONLY with the corrected text — no JSON, no code fences, no commentary "
+    "before or after."
+)
+
+AI_MOA_CORRECT_PROMPT = """Suggested Corrected Method of Assessment
+
+Extract the complete Method of Assessment section from the Qualification Specification and produce a corrected version for the course page.
+
+Requirements:
+* Use only information from the qualification specification.
+* Preserve the intended meaning of the specification.
+* Correct grammar, spelling, punctuation, and formatting.
+* Improve readability while keeping the information accurate.
+* If the course page wording differs from the specification, suggest wording that aligns with the specification.
+* If information is missing from the course page, include it.
+* If unnecessary information has been added to the course page, remove it.
+* Present the output as clean, publish-ready text that can be copied directly into the course page.
+
+Course: "{name}"
+
+QUALIFICATION SPECIFICATION — METHOD OF ASSESSMENT:
+{spec}
+
+CURRENT COURSE PAGE — METHOD OF ASSESSMENT:
+{page}
+"""
+
+
+def build_corrected_moa(qual_name: str, spec_moa: str, page_moa: str) -> str:
+    """Publish-ready corrected Method of Assessment based on the spec.
+    Falls back to the specification text itself if the AI reply fails or
+    looks incomplete (guarding against dropped content)."""
+    if not (spec_moa or "").strip():
+        return ""
+    fallback = spec_moa.strip()
+    try:
+        out = call_ai(AI_MOA_CORRECT_PROMPT.format(
+            name=qual_name, spec=spec_moa.strip(),
+            page=(page_moa or "").strip() or "(not found on the course page)"),
+            AI_MOA_CORRECT_SYSTEM).strip()
+        out = re.sub(r"^```[a-z]*\s*|\s*```$", "", out, flags=re.S).strip()
+        out = re.sub(r"^suggested corrected method of assessment:?\s*", "",
+                     out, flags=re.I).strip()
+        if out and len(out) >= 0.5 * len(fallback):
+            return out
+    except Exception:
+        pass
+    return fallback
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -771,16 +956,19 @@ def get_or_build_formatted(spec_url: str, qual_name: str, spec_entry: str) -> st
 # ═══════════════════════════════════════════════════════════════════
 
 def process_spec(url: str, force: bool = False, use_ai_fallback: bool = True) -> dict:
-    """Extract & cache the Entry Requirements of one spec document.
-    Skips work when the document is unchanged (hash match) unless force=True."""
+    """Extract & cache the Entry Requirements and Method of Assessment of one
+    spec document. Skips work when the document is unchanged (hash match)
+    unless force=True."""
     existing = get_spec(url)
     try:
         data = fetch_spec_bytes(url)
         doc_hash = hashlib.sha256(data).hexdigest()
         if (existing and existing["status"] == "ok" and not force
-                and existing["doc_hash"] == doc_hash and existing["entry_req"]):
+                and existing["doc_hash"] == doc_hash and existing["entry_req"]
+                and existing.get("moa")):
             return {"skipped": True, "status": "ok"}
         text = spec_bytes_to_text(data, url)
+
         entry = heuristic_entry_section(text)
         if use_ai_fallback and setting("api_key"):
             if not entry or len(entry) < 40:
@@ -797,8 +985,30 @@ def process_spec(url: str, force: bool = False, use_ai_fallback: bool = True) ->
                     entry = ai_entry
         if not entry:
             raise RuntimeError("Entry Requirements section not found in the document.")
-        save_spec(url, doc_hash=doc_hash, entry_req=entry, status="ok",
-                  error="", extracted_at=now(), entry_req_formatted="")
+
+        # Method of Assessment: same heuristic-plus-AI approach; a missing
+        # MoA section does not fail the whole spec (ER remains the primary
+        # check) — the MoA check will simply report it as unavailable.
+        moa = heuristic_moa_section(text)
+        if use_ai_fallback and setting("api_key"):
+            if not moa or len(moa) < 40:
+                try:
+                    moa = ai_extract_moa(text)
+                except Exception:
+                    pass
+            else:
+                pos = text.lower().find(moa[:60].lower())
+                window = text[max(0, pos - 1000):pos + len(moa) + 6000] if pos != -1 else text
+                try:
+                    ai_moa = ai_extract_moa(window)
+                    if len(ai_moa) > len(moa):
+                        moa = ai_moa
+                except Exception:
+                    pass
+
+        save_spec(url, doc_hash=doc_hash, entry_req=entry, moa=moa or "",
+                  status="ok", error="", extracted_at=now(),
+                  entry_req_formatted="")
         return {"skipped": False, "status": "ok"}
     except Exception as e:
         save_spec(url, status="error", error=str(e)[:500], extracted_at=now())
@@ -883,6 +1093,53 @@ def build_pdf(course, report) -> bytes:
     story += [Paragraph("Suggested Corrected Entry Requirements "
                         "(complete set from the qualification specification)", h2),
               Paragraph(esc(corrected) or "—", body)]
+
+    # ── Method of Assessment check ───────────────────────────────────
+    moa_issues = json.loads(report.get("moa_issues_json") or "{}")
+    if report.get("spec_moa") or report.get("page_moa"):
+        story += [Spacer(1, 8),
+                  Paragraph("Method of Assessment Check", h1)]
+        if report.get("moa_result"):
+            moa_color = GREEN if report["moa_result"] == "Pass" else RED
+            mt = Table([["Result", report["moa_result"]],
+                        ["Wording vs specification",
+                         (moa_issues.get("wording_match") or "—").capitalize()]],
+                       colWidths=[45*mm, 130*mm])
+            mt.setStyle(TableStyle([
+                ("FONTSIZE", (0, 0), (-1, -1), 9),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#BBBBBB")),
+                ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#F2F2F2")),
+                ("TEXTCOLOR", (1, 0), (1, 0), colors.HexColor(moa_color)),
+                ("FONTNAME", (1, 0), (1, 0), "Helvetica-Bold"),
+            ]))
+            story += [mt, Spacer(1, 4)]
+        if moa_issues.get("summary"):
+            story += [Paragraph("Summary", h2),
+                      Paragraph(esc(moa_issues["summary"]), body)]
+        story += [Paragraph("Method of Assessment — Course Page", h2),
+                  Paragraph(esc(report.get("page_moa")) or "—", body),
+                  Paragraph("Method of Assessment — Qualification Specification", h2),
+                  Paragraph(esc(report.get("spec_moa")) or "—", body)]
+
+        def moa_block(title, key):
+            items = moa_issues.get(key) or []
+            story.append(Paragraph(title, h2))
+            if items:
+                for i, it in enumerate(items, 1):
+                    story.append(Paragraph(f"{i}. {esc(it)}", body))
+            else:
+                story.append(Paragraph("None", body))
+
+        moa_block("Missing Assessment Methods", "missing_methods")
+        moa_block("Incorrect Wording", "incorrect_wording")
+        moa_block("Additional Information (not in specification)",
+                  "additional_information")
+        moa_block("Grammar & Formatting Issues", "grammar_formatting")
+
+        story += [Paragraph("Suggested Corrected Method of Assessment", h2),
+                  Paragraph(esc(report.get("moa_corrected")
+                                or report.get("spec_moa")) or "—", body)]
 
     doc.build(story)
     return buf.getvalue()
@@ -1038,9 +1295,13 @@ if page == "📥 Upload & Specs":
                 edited = st.text_area("Entry Requirements (cached — editable)",
                                       value=s["entry_req"] or "", height=160,
                                       key=f"spec_{s['id']}")
+                edited_moa = st.text_area("Method of Assessment (cached — editable)",
+                                          value=s.get("moa") or "", height=160,
+                                          key=f"specmoa_{s['id']}")
                 b1, b2 = st.columns(2)
                 if b1.button("Save edits", key=f"save_{s['id']}"):
-                    save_spec(s["url"], entry_req=edited, status="ok", error="",
+                    save_spec(s["url"], entry_req=edited, moa=edited_moa,
+                              status="ok", error="",
                               extracted_at=now(), entry_req_formatted="")
                     st.success("Saved.")
                 if b2.button("Force re-extract", key=f"re_{s['id']}"):
@@ -1095,22 +1356,33 @@ elif page == "▶️ Run Check":
             st.error("Add your OpenRouter API key in the sidebar first.")
             st.stop()
         try:
-            with st.spinner("1/3 Reading course page…"):
-                page_entry, full_text = extract_page_entry(course["course_url"])
+            with st.spinner("1/4 Reading course page…"):
+                page_entry, page_moa, full_text = extract_page_sections(course["course_url"])
                 if not page_entry:
                     page_entry = ai_extract_entry(full_text)
-            spec_entry = ""
+                if not page_moa:
+                    try:
+                        page_moa = ai_extract_moa(full_text)
+                    except Exception:
+                        page_moa = ""
+            spec_entry = spec_moa = ""
             if course["spec_url"]:
-                with st.spinner("2/3 Loading specification (cached when possible)…"):
+                with st.spinner("2/4 Loading specification (cached when possible)…"):
                     if not spec_ready:
                         process_spec(course["spec_url"])
                     spec_row = get_spec(course["spec_url"])
                     if spec_row and spec_row["status"] == "ok":
                         spec_entry = spec_row["entry_req"] or ""
+                        spec_moa = spec_row.get("moa") or ""
+                        if not spec_moa:  # cached before MoA support → refresh
+                            process_spec(course["spec_url"], force=True)
+                            spec_row = get_spec(course["spec_url"])
+                            spec_moa = (spec_row.get("moa") or "") if spec_row else ""
+                            spec_entry = (spec_row.get("entry_req") or spec_entry) if spec_row else spec_entry
                     else:
                         st.warning("Specification could not be extracted: "
                                    f"{spec_row['error'] if spec_row else 'unknown error'}")
-            with st.spinner("3/3 Comparing & formatting with AI…"):
+            with st.spinner("3/4 Checking Entry Requirements with AI…"):
                 verdict = ai_compare(course["name"], page_entry, spec_entry,
                                      course["excel_entry"] or "")
                 if spec_entry.strip():
@@ -1118,9 +1390,20 @@ elif page == "▶️ Run Check":
                         course["spec_url"], course["name"], spec_entry)
                 else:
                     corrected = verdict.get("corrected_entry_requirements", "")
+            moa_verdict, moa_corrected, moa_result = {}, "", ""
+            with st.spinner("4/4 Checking Method of Assessment with AI…"):
+                if spec_moa.strip() or page_moa.strip():
+                    moa_verdict = ai_compare_moa(course["name"], page_moa, spec_moa)
+                    moa_result = ("Pass" if str(moa_verdict.get("result", "")).lower()
+                                  == "pass" else "Fail")
+                    moa_corrected = build_corrected_moa(course["name"],
+                                                        spec_moa, page_moa)
             result = "Pass" if str(verdict.get("result", "")).lower() == "pass" else "Fail"
             save_report(course["id"], result, page_entry, spec_entry,
-                        course["excel_entry"] or "", verdict, corrected)
+                        course["excel_entry"] or "", verdict, corrected,
+                        page_moa=page_moa, spec_moa=spec_moa,
+                        moa_issues=moa_verdict, moa_corrected=moa_corrected,
+                        moa_result=moa_result)
             st.success("Check complete.")
         except Exception as e:
             st.error(f"Check failed: {e}")
@@ -1128,29 +1411,21 @@ elif page == "▶️ Run Check":
     report = latest_report(course["id"])
     if report:
         issues = json.loads(report["issues_json"] or "{}")
+        moa_issues = json.loads(report.get("moa_issues_json") or "{}")
         st.divider()
         st.subheader("Validation Report")
-        st.markdown(f"**Result:** {badge(report['result'])} &nbsp;·&nbsp; "
+        moa_badge_html = (f" &nbsp;·&nbsp; **Method of Assessment:** "
+                          f"{badge(report['moa_result'])}"
+                          if report.get("moa_result") else "")
+        st.markdown(f"**Entry Requirements:** {badge(report['result'])}"
+                    f"{moa_badge_html} &nbsp;·&nbsp; "
                     f"checked {report['created_at']}", unsafe_allow_html=True)
-        if issues.get("summary"):
-            st.markdown(f"> {issues['summary']}")
 
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.markdown("**Course Page**")
-            st.text_area("page", report["page_entry"] or "—", height=220,
-                         label_visibility="collapsed", disabled=True)
-        with c2:
-            st.markdown("**Qualification Specification**")
-            st.text_area("spec", report["spec_entry"] or "—", height=220,
-                         label_visibility="collapsed", disabled=True)
-        with c3:
-            st.markdown("**Excel Tracker**")
-            st.text_area("excel", report["excel_entry"] or "—", height=220,
-                         label_visibility="collapsed", disabled=True)
+        tab_er, tab_moa = st.tabs(["📋 Entry Requirements",
+                                   "📝 Method of Assessment"])
 
-        def show_issues(title, key, color):
-            items = issues.get(key) or []
+        def show_issues(issue_dict, title, key, color, prefix):
+            items = issue_dict.get(key) or []
             st.markdown(f"**{title}** "
                         f"<span style='color:{color}'>({len(items)})</span>",
                         unsafe_allow_html=True)
@@ -1160,22 +1435,94 @@ elif page == "▶️ Run Check":
             else:
                 st.caption("None")
 
-        i1, i2 = st.columns(2)
-        with i1:
-            show_issues("Missing Requirements", "missing_requirements", RED)
-            show_issues("Incorrect Requirements", "incorrect_requirements", RED)
-        with i2:
-            show_issues("Wording Differences", "wording_differences", AMBER)
-            show_issues("Grammar & Spelling", "grammar_spelling", AMBER)
+        # ── TAB 1: Entry Requirements ────────────────────────────────
+        with tab_er:
+            if issues.get("summary"):
+                st.markdown(f"> {issues['summary']}")
 
-        st.markdown("**Suggested Corrected Entry Requirements**")
-        st.caption("Complete set of entry requirements from the qualification "
-                   "specification, point by point — compare directly with the "
-                   "course page requirements above.")
-        corrected_txt = strip_excluded_sections(
-            (report["corrected"] or "").strip()
-            or build_corrected_entry(report["spec_entry"], ""))
-        st.markdown(corrected_txt or "—")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.markdown("**Course Page**")
+                st.text_area("page", report["page_entry"] or "—", height=220,
+                             label_visibility="collapsed", disabled=True)
+            with c2:
+                st.markdown("**Qualification Specification**")
+                st.text_area("spec", report["spec_entry"] or "—", height=220,
+                             label_visibility="collapsed", disabled=True)
+            with c3:
+                st.markdown("**Excel Tracker**")
+                st.text_area("excel", report["excel_entry"] or "—", height=220,
+                             label_visibility="collapsed", disabled=True)
+
+            i1, i2 = st.columns(2)
+            with i1:
+                show_issues(issues, "Missing Requirements",
+                            "missing_requirements", RED, "er")
+                show_issues(issues, "Incorrect Requirements",
+                            "incorrect_requirements", RED, "er")
+            with i2:
+                show_issues(issues, "Wording Differences",
+                            "wording_differences", AMBER, "er")
+                show_issues(issues, "Grammar & Spelling",
+                            "grammar_spelling", AMBER, "er")
+
+            st.markdown("**Suggested Corrected Entry Requirements**")
+            st.caption("Complete set of entry requirements from the qualification "
+                       "specification, point by point — compare directly with the "
+                       "course page requirements above.")
+            corrected_txt = strip_excluded_sections(
+                (report["corrected"] or "").strip()
+                or build_corrected_entry(report["spec_entry"], ""))
+            st.markdown(corrected_txt or "—")
+
+        # ── TAB 2: Method of Assessment ──────────────────────────────
+        with tab_moa:
+            if not (report.get("spec_moa") or report.get("page_moa")):
+                st.info("No Method of Assessment was found — run the check "
+                        "again to extract it (older reports predate this "
+                        "check).")
+            else:
+                if moa_issues.get("summary"):
+                    st.markdown(f"> {moa_issues['summary']}")
+                wm = (moa_issues.get("wording_match") or "").capitalize()
+                if wm:
+                    wm_color = {"Identical": GREEN, "Similar": AMBER,
+                                "Different": RED}.get(wm, AMBER)
+                    st.markdown(f"**Wording vs specification:** "
+                                f"<span style='color:{wm_color};font-weight:700'>"
+                                f"{wm}</span>", unsafe_allow_html=True)
+
+                m1, m2 = st.columns(2)
+                with m1:
+                    st.markdown("**Course Page**")
+                    st.text_area("moa_page", report.get("page_moa") or "—",
+                                 height=220, label_visibility="collapsed",
+                                 disabled=True)
+                with m2:
+                    st.markdown("**Qualification Specification**")
+                    st.text_area("moa_spec", report.get("spec_moa") or "—",
+                                 height=220, label_visibility="collapsed",
+                                 disabled=True)
+
+                j1, j2 = st.columns(2)
+                with j1:
+                    show_issues(moa_issues, "Missing Assessment Methods",
+                                "missing_methods", RED, "moa")
+                    show_issues(moa_issues, "Incorrect Wording",
+                                "incorrect_wording", RED, "moa")
+                with j2:
+                    show_issues(moa_issues, "Additional Information "
+                                "(not in specification)",
+                                "additional_information", AMBER, "moa")
+                    show_issues(moa_issues, "Grammar & Formatting",
+                                "grammar_formatting", AMBER, "moa")
+
+                st.markdown("**Suggested Corrected Method of Assessment**")
+                st.caption("Publish-ready text based only on the qualification "
+                           "specification — can be copied directly into the "
+                           "course page.")
+                st.markdown(report.get("moa_corrected")
+                            or (report.get("spec_moa") or "—"))
 
         pdf = build_pdf(course, report)
         st.download_button("⬇️ Download Report (PDF)", data=pdf,
@@ -1191,10 +1538,15 @@ elif page == "📄 Reports":
         st.info("No reports yet — run a check first.")
     for r in reports:
         icon = "🟢" if r["result"] == "Pass" else "🔴"
-        with st.expander(f"{icon} {r['result']} · {r['course_name']} · {r['created_at']}"):
+        moa_tag = f" · MoA: {r['moa_result']}" if r.get("moa_result") else ""
+        with st.expander(f"{icon} {r['result']}{moa_tag} · {r['course_name']} "
+                         f"· {r['created_at']}"):
             issues = json.loads(r["issues_json"] or "{}")
             if issues.get("summary"):
-                st.markdown(f"> {issues['summary']}")
+                st.markdown(f"> Entry Requirements: {issues['summary']}")
+            moa_issues = json.loads(r.get("moa_issues_json") or "{}")
+            if moa_issues.get("summary"):
+                st.markdown(f"> Method of Assessment: {moa_issues['summary']}")
             course = get_course(r["course_id"])
             if course:
                 pdf = build_pdf(course, r)
