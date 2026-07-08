@@ -641,24 +641,54 @@ RULES — follow ALL of them:
 4. One "* " bullet per requirement category, starting with a bold-free short label followed by a colon.
 5. Where the source lists alternatives or multiple items (e.g. GCSE options, English tests), put each item on its own nested bullet indented with 4 spaces: "    * item".
 6. Do not invent requirements that are not in the source text.
+7. EXCLUDE anything about "Reasonable Adjustments" and "Special Considerations" — do not output that section or any of its content, even if it appears in the source text.
+
 
 ENTRY REQUIREMENTS (source text):
 {spec}
 """
 
 
+# Sections that must never appear in the suggested output
+_EXCLUDED_SECTIONS = re.compile(
+    r"reasonable\s+adjustments?|special\s+considerations?", re.I)
+
+
+def strip_excluded_sections(text: str) -> str:
+    """Remove excluded sections (e.g. 'Reasonable Adjustments and Special
+    Considerations') from the formatted output, including their nested
+    sub-bullets. A top-level bullet whose label matches is dropped together
+    with every indented line that follows it."""
+    out, skipping = [], False
+    for ln in (text or "").split("\n"):
+        stripped = ln.lstrip()
+        indent = len(ln) - len(stripped)
+        is_bullet = stripped.startswith(("* ", "- ", "• "))
+        top_level = (is_bullet and indent == 0) or (not is_bullet and stripped)
+        if top_level:
+            skipping = bool(_EXCLUDED_SECTIONS.search(stripped[:80]))
+        if not skipping:
+            out.append(ln)
+    # tidy runs of blank lines left behind
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+
 def format_spec_entry(qual_name: str, spec_entry: str) -> str:
     """AI-format the spec's Entry Requirements into the categorised
     point-by-point layout. Falls back to the deterministic list if the
     AI reply fails or looks incomplete (guarding against omissions)."""
-    fallback = spec_to_points(spec_entry)
+    fallback = strip_excluded_sections(spec_to_points(spec_entry))
+
     try:
         out = call_ai(AI_FORMAT_PROMPT.format(name=qual_name, spec=spec_entry),
                       AI_FORMAT_SYSTEM).strip()
         out = re.sub(r"^```[a-z]*\s*|\s*```$", "", out, flags=re.S).strip()
+        out = strip_excluded_sections(out)
         # completeness guard: a faithful reformat of the full spec cannot be
         # much shorter than the source — if it is, requirements were dropped
-        if out and len(out) >= 0.6 * len(spec_entry.strip()):
+        # (the excluded section is discounted from the source length first)
+        src = strip_excluded_sections(spec_to_points(spec_entry))
+        if out and len(out) >= 0.6 * len(src):
+
             return out
     except Exception:
         pass
@@ -666,16 +696,20 @@ def format_spec_entry(qual_name: str, spec_entry: str) -> str:
 
 
 def get_or_build_formatted(spec_url: str, qual_name: str, spec_entry: str) -> str:
-    """Formatted spec requirements, cached per specification document."""
+    """Formatted spec requirements, cached per specification document.
+    Cached values are passed through the exclusion filter so entries
+    formatted before an exclusion rule was added are cleaned up too."""
     row = get_spec(spec_url) if spec_url else None
     if row and row.get("entry_req_formatted"):
-        return row["entry_req_formatted"]
+        return strip_excluded_sections(row["entry_req_formatted"])
+
     formatted = format_spec_entry(qual_name, spec_entry)
     if row and formatted:
         save_spec(spec_url, entry_req_formatted=formatted)
     return formatted
 
 
+>>>>>>> d12ce6806d4f691f6d7fe72022e5c61b1ee65633
 # ═══════════════════════════════════════════════════════════════════
 #  SPEC PROCESSING (once per unique document)
 # ═══════════════════════════════════════════════════════════════════
@@ -787,8 +821,11 @@ def build_pdf(course, report) -> bytes:
     issue_block("Wording Differences (meaning-changing)", "wording_differences")
     issue_block("Grammar & Spelling Issues", "grammar_spelling")
 
-    corrected = (report["corrected"] or "").strip() \
-        or build_corrected_entry(report["spec_entry"], "")
+    corrected = strip_excluded_sections(
+        (report["corrected"] or "").strip()
+        or build_corrected_entry(report["spec_entry"], report["corrected"]))
+
+>>>>>>> d12ce6806d4f691f6d7fe72022e5c61b1ee65633
     story += [Paragraph("Suggested Corrected Entry Requirements "
                         "(complete set from the qualification specification)", h2),
               Paragraph(esc(corrected) or "—", body)]
@@ -1022,6 +1059,8 @@ elif page == "▶️ Run Check":
                 else:
                     corrected = verdict.get("corrected_entry_requirements", "")
             result = "Pass" if str(verdict.get("result", "")).lower() == "pass" else "Fail"
+            corrected = build_corrected_entry(
+                spec_entry, verdict.get("corrected_entry_requirements", ""))
             save_report(course["id"], result, page_entry, spec_entry,
                         course["excel_entry"] or "", verdict, corrected)
             st.success("Check complete.")
@@ -1075,9 +1114,12 @@ elif page == "▶️ Run Check":
         st.caption("Complete set of entry requirements from the qualification "
                    "specification, point by point — compare directly with the "
                    "course page requirements above.")
-        corrected_txt = (report["corrected"] or "").strip() \
-            or build_corrected_entry(report["spec_entry"], "")
+        corrected_txt = strip_excluded_sections(
+            (report["corrected"] or "").strip()
+            or build_corrected_entry(report["spec_entry"], report["corrected"]))
         st.markdown(corrected_txt or "—")
+
+>>>>>>> d12ce6806d4f691f6d7fe72022e5c61b1ee65633
 
         pdf = build_pdf(course, report)
         st.download_button("⬇️ Download Report (PDF)", data=pdf,
