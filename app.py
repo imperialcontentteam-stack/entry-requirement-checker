@@ -319,22 +319,44 @@ def spec_bytes_to_text(data: bytes, url: str = "", max_chars: int = 150000) -> s
 
 
 ENTRY_HEADING = r"entry\s+requirements?|entry\s+criteria|admission\s+requirements?"
+
+# Words/phrases that begin the NEXT section of a spec document.
+# NOTE: bare generic words (resources, support, contact, assessment, units…)
+# previously matched ordinary body-text lines — PDF extraction preserves the
+# document's visual line-wrapping, so a sentence like
+#   "…to enable them to access relevant\nresources and complete the unit assignments."
+# was mistaken for a "Resources" heading and truncated the section, silently
+# dropping everything after it (e.g. the IELTS / CEFR / CAE / PTE list).
+_STOP_WORDS = (
+    r"method(?:s)?\s+of\s+assessment|assessment(?:\s+(?:overview|methods?|and\s+grading|strategy))?"
+    r"|progression(?:\s+(?:opportunities|routes?))?|grading"
+    r"|units?(?:\s+(?:overview|summary))?|qualification\s+structure|unit\s+structure"
+    r"|guided\s+learning(?:\s+hours)?|total\s+qualification\s+time"
+    r"|course\s+content|learning\s+outcomes?|funding|centre(?:\s+requirements?)?"
+    r"|appendix(?:\s+\w+)?|introduction|support(?:\s+for\s+learners)?"
+    r"|resources?(?:\s+required)?|contact(?:\s+us)?"
+    r"|reasonable\s+adjustments|recognition\s+of\s+prior(?:\s+learning)?"
+)
+
+# A stop match only counts as a heading when it occupies (almost) the whole
+# line: optional section number before, optional colon after, then end of
+# line. A wrapped sentence continuing after the word will NOT match.
 STOP_HEADINGS = (
-    r"(?:^|\n)\s*(?:\d+(?:\.\d+)*\s+)?"
-    r"(method(?:s)?\s+of\s+assessment|assessment|progression|grading|units?"
-    r"|guided\s+learning|total\s+qualification\s+time|qualification\s+structure"
-    r"|course\s+content|learning\s+outcomes?|funding|centre|appendix"
-    r"|introduction|support|resources|contact|english\s+language\s+requirements?"
-    r"|reasonable\s+adjustments|recognition\s+of\s+prior)\b"
+    rf"(?:^|\n)[ \t]*(?:\d+(?:\.\d+)*\.?[ \t]+)?"
+    rf"(?:{_STOP_WORDS})"
+    rf"[ \t]*:?[ \t]*(?=\n|$)"
 )
 
 
-def heuristic_entry_section(text: str, max_chars: int = 4000) -> str:
+def heuristic_entry_section(text: str, max_chars: int = 6000) -> str:
     """Pull the Entry Requirements section out of a document's text.
-    Skips table-of-contents hits (dot leaders / bare page numbers)."""
+    Skips table-of-contents hits (dot leaders / bare page numbers) and,
+    when the heading appears more than once, keeps the longest candidate
+    (body section) rather than the first (often a passing mention)."""
     if not text:
         return ""
-    for m in re.finditer(rf"(?:^|\n)\s*(?:\d+(?:\.\d+)*\s+)?(?:{ENTRY_HEADING})"
+    best = ""
+    for m in re.finditer(rf"(?:^|\n)\s*(?:\d+(?:\.\d+)*\.?\s+)?(?:{ENTRY_HEADING})"
                          rf"\s*:?\s*\n?", text, re.I):
         start = m.end()
         stop = re.search(STOP_HEADINGS, text[start:], re.I)
@@ -344,9 +366,9 @@ def heuristic_entry_section(text: str, max_chars: int = 4000) -> str:
         # TOC lines look like "..... 7" or just a page number
         if re.match(r"^[.·\s]*\d{1,3}\s*$", head) or re.match(r"^\.{4,}", head):
             continue
-        if len(chunk) >= 40:
-            return chunk
-    return ""
+        if len(chunk) > len(best):
+            best = chunk
+    return best if len(best) >= 40 else ""
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -543,8 +565,19 @@ def process_spec(url: str, force: bool = False, use_ai_fallback: bool = True) ->
             return {"skipped": True, "status": "ok"}
         text = spec_bytes_to_text(data, url)
         entry = heuristic_entry_section(text)
-        if (not entry or len(entry) < 40) and use_ai_fallback and setting("api_key"):
-            entry = ai_extract_entry(text)
+        if use_ai_fallback and setting("api_key"):
+            if not entry or len(entry) < 40:
+                # heuristic found nothing — let the AI search the document
+                entry = ai_extract_entry(text)
+            else:
+                # heuristic found a section — cross-check it against an AI
+                # extraction of the surrounding window; keep the more
+                # complete of the two (guards against silent truncation)
+                pos = text.lower().find(entry[:60].lower())
+                window = text[max(0, pos - 1000):pos + len(entry) + 6000] if pos != -1 else text
+                ai_entry = ai_extract_entry(window)
+                if len(ai_entry) > len(entry):
+                    entry = ai_entry
         if not entry:
             raise RuntimeError("Entry Requirements section not found in the document.")
         save_spec(url, doc_hash=doc_hash, entry_req=entry, status="ok",
