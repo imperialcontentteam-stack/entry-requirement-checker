@@ -613,6 +613,7 @@ def build_corrected_entry(spec_entry: str, ai_corrected: str) -> str:
     return (ai_corrected or "").strip()
 
 
+<<<<<<< HEAD
 # ── AI formatting into the categorised, point-by-point layout ────────
 
 AI_FORMAT_SYSTEM = (
@@ -706,6 +707,8 @@ def get_or_build_formatted(spec_url: str, qual_name: str, spec_entry: str) -> st
     return formatted
 
 
+=======
+>>>>>>> 056912bcae42180cabc6ceca339095591df49fcf
 # ═══════════════════════════════════════════════════════════════════
 #  SPEC PROCESSING (once per unique document)
 # ═══════════════════════════════════════════════════════════════════
@@ -817,9 +820,13 @@ def build_pdf(course, report) -> bytes:
     issue_block("Wording Differences (meaning-changing)", "wording_differences")
     issue_block("Grammar & Spelling Issues", "grammar_spelling")
 
+<<<<<<< HEAD
     corrected = strip_excluded_sections(
         (report["corrected"] or "").strip()
         or build_corrected_entry(report["spec_entry"], ""))
+=======
+    corrected = build_corrected_entry(report["spec_entry"], report["corrected"])
+>>>>>>> 056912bcae42180cabc6ceca339095591df49fcf
     story += [Paragraph("Suggested Corrected Entry Requirements "
                         "(complete set from the qualification specification)", h2),
               Paragraph(esc(corrected) or "—", body)]
@@ -1053,6 +1060,8 @@ elif page == "▶️ Run Check":
                 else:
                     corrected = verdict.get("corrected_entry_requirements", "")
             result = "Pass" if str(verdict.get("result", "")).lower() == "pass" else "Fail"
+            corrected = build_corrected_entry(
+                spec_entry, verdict.get("corrected_entry_requirements", ""))
             save_report(course["id"], result, page_entry, spec_entry,
                         course["excel_entry"] or "", verdict, corrected)
             st.success("Check complete.")
@@ -1106,10 +1115,15 @@ elif page == "▶️ Run Check":
         st.caption("Complete set of entry requirements from the qualification "
                    "specification, point by point — compare directly with the "
                    "course page requirements above.")
+<<<<<<< HEAD
         corrected_txt = strip_excluded_sections(
             (report["corrected"] or "").strip()
             or build_corrected_entry(report["spec_entry"], ""))
         st.markdown(corrected_txt or "—")
+=======
+        st.info(build_corrected_entry(report["spec_entry"],
+                                      report["corrected"]) or "—")
+>>>>>>> 056912bcae42180cabc6ceca339095591df49fcf
 
         pdf = build_pdf(course, report)
         st.download_button("⬇️ Download Report (PDF)", data=pdf,
