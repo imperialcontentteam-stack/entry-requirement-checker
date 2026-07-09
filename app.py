@@ -33,8 +33,10 @@ import json
 import os
 import re
 import shutil
+import concurrent.futures
 import sqlite3
 import tempfile
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -347,30 +349,89 @@ def delete_report(report_id: int):
 #  EXTRACTION — spec documents
 # ═══════════════════════════════════════════════════════════════════
 
-def _direct_download_url(url: str) -> str:
-    """Turn Google Drive share links into direct-download URLs."""
-    m = re.search(r"drive\.google\.com/file/d/([^/?#]+)", url or "")
-    if m:
-        return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
-    m = re.search(r"drive\.google\.com/open\?id=([^&#]+)", url or "")
-    if m:
-        return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
-    return url
+def _drive_file_id(url: str):
+    """Extract the file id from any common Google Drive link shape."""
+    for pat in (r"drive\.google\.com/file/d/([^/?#]+)",
+                r"drive\.google\.com/(?:open|uc)\?[^#]*?id=([^&#]+)",
+                r"drive\.usercontent\.google\.com/download\?[^#]*?id=([^&#]+)"):
+        m = re.search(pat, url or "")
+        if m:
+            return m.group(1)
+    return None
+
+
+def _drive_html_problem(data: bytes):
+    """If Drive returned an HTML page instead of the file, say why."""
+    head = data[:6000]
+    if b"<html" not in head.lower() and b"<!doctype" not in head.lower():
+        return None
+    low = head.lower()
+    if b"virus scan warning" in low or b"confirm=" in low:
+        return "scan-page"          # bypassable — handled by caller
+    if b"you can't view or download" in low or b"sorry" in low and b"download" in low:
+        return ("Google Drive refused the download — open the file's Share "
+                "settings and set it to 'Anyone with the link'.")
+    if b"accounts.google.com" in low or b"sign in" in low:
+        return ("Google Drive link requires sign-in — set the file's sharing "
+                "to 'Anyone with the link'.")
+    if b"too many users have viewed or downloaded" in low or b"quota" in low:
+        return ("Google Drive download quota exceeded for this file — try "
+                "again later or re-upload a copy.")
+    if b"file does not exist" in low or b"not found" in low:
+        return "Google Drive file not found — the link may be broken."
+    return ("Google Drive returned a web page instead of the document — "
+            "check the link is a direct file share set to 'Anyone with the link'.")
 
 
 def fetch_spec_bytes(url: str) -> bytes:
-    resp = requests.get(_direct_download_url(url), headers=USER_AGENT,
-                        timeout=90, allow_redirects=True)
+    """Download a specification document. Handles Google Drive share links
+    (including large files behind the virus-scan page and Google Docs
+    native documents), plus ordinary PDF/DOCX/web-page URLs."""
+    # Google Docs native document → export as PDF
+    m = re.search(r"docs\.google\.com/document/d/([^/?#]+)", url or "")
+    if m:
+        u = f"https://docs.google.com/document/d/{m.group(1)}/export?format=pdf"
+        resp = requests.get(u, headers=USER_AGENT, timeout=90, allow_redirects=True)
+        resp.raise_for_status()
+        return resp.content
+
+    fid = _drive_file_id(url)
+    if fid:
+        # modern endpoint first (confirm=t skips the virus-scan page),
+        # legacy endpoint as backup
+        candidates = [
+            f"https://drive.usercontent.google.com/download?id={fid}"
+            f"&export=download&confirm=t",
+            f"https://drive.google.com/uc?export=download&id={fid}&confirm=t",
+        ]
+        problem = None
+        for u in candidates:
+            resp = requests.get(u, headers=USER_AGENT, timeout=90,
+                                allow_redirects=True)
+            if not resp.ok:
+                problem = f"HTTP {resp.status_code} from Google Drive"
+                continue
+            issue = _drive_html_problem(resp.content)
+            if issue is None:
+                return resp.content
+            if issue == "scan-page":
+                # old-style scan page: scrape the confirm link and retry
+                mm = re.search(rb'href="([^"]*confirm=[^"]*)"', resp.content)
+                if mm:
+                    cu = mm.group(1).decode().replace("&amp;", "&")
+                    if cu.startswith("/"):
+                        cu = "https://drive.google.com" + cu
+                    r2 = requests.get(cu, headers=USER_AGENT, timeout=90)
+                    if r2.ok and _drive_html_problem(r2.content) is None:
+                        return r2.content
+                problem = "could not pass the Drive virus-scan page"
+            else:
+                problem = issue
+        raise RuntimeError(problem or "Google Drive download failed")
+
+    # not a Drive link — fetch directly (PDF, DOCX or a spec web page)
+    resp = requests.get(url, headers=USER_AGENT, timeout=90, allow_redirects=True)
     resp.raise_for_status()
-    # Google Drive sometimes interposes a virus-scan confirmation page
-    if b"confirm=" in resp.content[:4000] and b"<html" in resp.content[:200].lower():
-        m = re.search(rb'href="([^"]*confirm=[^"]*)"', resp.content)
-        if m:
-            confirm_url = m.group(1).decode().replace("&amp;", "&")
-            if confirm_url.startswith("/"):
-                confirm_url = "https://drive.google.com" + confirm_url
-            resp = requests.get(confirm_url, headers=USER_AGENT, timeout=90)
-            resp.raise_for_status()
     return resp.content
 
 
@@ -594,10 +655,11 @@ def openrouter_api_key() -> str:
 
 
 # gentle client-side pacing + automatic retry, because each check makes
-# several AI calls in a burst and OpenRouter rate-limits by account tier
-_MIN_CALL_GAP = 1.2      # seconds between requests
+# several AI calls (now in parallel) and OpenRouter rate-limits by tier
+_MIN_CALL_GAP = 0.35     # seconds between request starts (thread-safe)
 _MAX_RETRIES = 5         # attempts on 429 / 5xx before giving up
 _last_call_ts = [0.0]
+_call_lock = threading.Lock()
 
 
 def call_ai(prompt: str, system: str, temperature: float = 0.0) -> str:
@@ -628,13 +690,14 @@ def call_ai(prompt: str, system: str, temperature: float = 0.0) -> str:
 
     last_resp = None
     for attempt in range(_MAX_RETRIES):
-        # pace requests so bursts don't trip the per-minute limit
-        gap = _MIN_CALL_GAP - (time.time() - _last_call_ts[0])
-        if gap > 0:
-            time.sleep(gap)
+        # pace request starts so parallel bursts don't trip the rate limit
+        with _call_lock:
+            gap = _MIN_CALL_GAP - (time.time() - _last_call_ts[0])
+            if gap > 0:
+                time.sleep(gap)
+            _last_call_ts[0] = time.time()
         resp = requests.post(OPENROUTER_URL, headers=headers, json=payload,
                              timeout=180)
-        _last_call_ts[0] = time.time()
         last_resp = resp
         if resp.status_code == 429 or resp.status_code >= 500:
             # honour Retry-After when present, else exponential backoff
@@ -1530,24 +1593,50 @@ elif page == "▶️ Run Check":
                     else:
                         st.warning("Specification could not be extracted: "
                                    f"{spec_row['error'] if spec_row else 'unknown error'}")
-            prog.step(3, "Checking Entry Requirements with AI")
-            with st.spinner("Checking Entry Requirements…"):
-                verdict = ai_compare(course["name"], page_entry, spec_entry,
-                                     course["excel_entry"] or "")
-                if spec_entry.strip():
-                    corrected = get_or_build_formatted(
-                        course["spec_url"], course["name"], spec_entry)
-                else:
-                    corrected = verdict.get("corrected_entry_requirements", "")
-            moa_verdict, moa_corrected, moa_result = {}, "", ""
-            prog.step(4, "Checking Method of Assessment with AI")
-            with st.spinner("Checking Method of Assessment…"):
+            # ── steps 3+4: all AI checks run IN PARALLEL ──────────────
+            prog.step(3, "Running AI checks (Entry Requirements + Method of "
+                         "Assessment in parallel)")
+            # worker threads can't always read st.secrets — mirror the key
+            # into the environment so call_ai's fallback finds it
+            _k = openrouter_api_key()
+            if _k:
+                os.environ["OPENROUTER_API_KEY"] = _k
+
+            # formatted ER: check the cache on the main thread (DB access),
+            # only the AI formatting itself goes to the pool
+            fmt_cached = ""
+            spec_row_f = get_spec(course["spec_url"]) if course["spec_url"] else None
+            if spec_row_f and spec_row_f.get("entry_req_formatted"):
+                fmt_cached = strip_excluded_sections(spec_row_f["entry_req_formatted"])
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                f_er = pool.submit(ai_compare, course["name"], page_entry,
+                                   spec_entry, course["excel_entry"] or "")
+                f_moa = f_corr_moa = f_fmt = None
                 if spec_moa.strip() or page_moa.strip():
-                    moa_verdict = ai_compare_moa(course["name"], page_moa, spec_moa)
-                    moa_result = ("Pass" if str(moa_verdict.get("result", "")).lower()
-                                  == "pass" else "Fail")
-                    moa_corrected = build_corrected_moa(course["name"],
-                                                        spec_moa, page_moa)
+                    f_moa = pool.submit(ai_compare_moa, course["name"],
+                                        page_moa, spec_moa)
+                    f_corr_moa = pool.submit(build_corrected_moa,
+                                             course["name"], spec_moa, page_moa)
+                if spec_entry.strip() and not fmt_cached:
+                    f_fmt = pool.submit(format_spec_entry, course["name"],
+                                        spec_entry)
+                verdict = f_er.result()
+                moa_verdict = f_moa.result() if f_moa else {}
+                moa_corrected = f_corr_moa.result() if f_corr_moa else ""
+                fmt_new = f_fmt.result() if f_fmt else ""
+
+            prog.step(4, "Finalising report")
+            if spec_entry.strip():
+                corrected = fmt_cached or fmt_new
+                if fmt_new and spec_row_f:      # cache for next time (main thread)
+                    save_spec(course["spec_url"], entry_req_formatted=fmt_new)
+            else:
+                corrected = verdict.get("corrected_entry_requirements", "")
+            moa_result = ""
+            if moa_verdict:
+                moa_result = ("Pass" if str(moa_verdict.get("result", "")).lower()
+                              == "pass" else "Fail")
             result = "Pass" if str(verdict.get("result", "")).lower() == "pass" else "Fail"
             save_report(course["id"], result, page_entry, spec_entry,
                         course["excel_entry"] or "", verdict, corrected,
