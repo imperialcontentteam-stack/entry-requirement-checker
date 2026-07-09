@@ -101,6 +101,55 @@ def _writable_db_path() -> str:
 
 DB_PATH = _writable_db_path()
 
+
+def _quarantine_bad_db(path: str, reason: str = "") -> None:
+    """Move an invalid/corrupt SQLite DB aside so the app can recreate it.
+
+    Streamlit Cloud redacts sqlite3.DatabaseError messages, but the common
+    cause at startup is a damaged or non-SQLite er_checker.db file. Keeping a
+    timestamped backup avoids silently deleting user data.
+    """
+    db = Path(path)
+    if not db.exists():
+        return
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    bad = db.with_name(f"{db.stem}.bad_{stamp}{db.suffix}")
+    try:
+        db.rename(bad)
+        print(f"SQLite database was quarantined at {bad}. {reason}")
+    except OSError:
+        # Last resort: remove the file so init_db can create a clean DB.
+        try:
+            db.unlink()
+            print(f"SQLite database was removed because it could not be opened. {reason}")
+        except OSError:
+            pass
+
+
+def _ensure_sqlite_db_is_usable(path: str) -> None:
+    """Validate an existing DB before Streamlit caches the connection."""
+    db = Path(path)
+    if not db.exists() or db.stat().st_size == 0:
+        return
+    try:
+        conn = sqlite3.connect(path, timeout=30)
+        try:
+            result = conn.execute("PRAGMA quick_check").fetchone()
+            if not result or str(result[0]).lower() != "ok":
+                conn.close()
+                _quarantine_bad_db(path, "PRAGMA quick_check failed.")
+                return
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except sqlite3.DatabaseError as exc:
+        _quarantine_bad_db(path, f"DatabaseError during validation: {exc}")
+
+
+_ensure_sqlite_db_is_usable(DB_PATH)
+
 USER_AGENT = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                    "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -120,7 +169,7 @@ APP_VERSION = "2.0.0"
 
 @st.cache_resource
 def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -190,8 +239,12 @@ def init_db():
     for m in migrations:
         try:
             c.execute(m)
-        except sqlite3.OperationalError:
-            pass  # column already exists
+        except sqlite3.OperationalError as exc:
+            # Expected when the app has already run this migration before.
+            if "duplicate column name" in str(exc).lower():
+                pass
+            else:
+                raise
     c.commit()
 
 
