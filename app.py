@@ -22,7 +22,7 @@ Everything the user uploads (courses, cached spec extractions, reports)
 is stored in SQLite (er_checker.db) and kept until the user removes it
 from the Manage Data page.
 
-Stack:  Python · Streamlit · SQLite · DeepInfra API · reportlab
+Stack:  Python · Streamlit · SQLite · OpenRouter API (US hosts) · reportlab
 Run:    streamlit run app.py
 """
 
@@ -567,46 +567,57 @@ def extract_page_entry(url: str) -> tuple:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  AI (DeepInfra)
+#  AI (OpenRouter · US providers)
 # ═══════════════════════════════════════════════════════════════════
 
-# ── LLM configuration — DeepInfra ONLY ───────────────────────────────
+# ── LLM configuration — OpenRouter, pinned to US-hosted providers ────
 # The provider is fixed internally; there is no provider or API-key UI.
+# Requests go through OpenRouter but are ONLY served by US hosts
+# (DeepInfra first, then Fireworks/Together) — never DeepSeek's own API.
 # The API key is read from Streamlit Secrets (.streamlit/secrets.toml):
-#   DEEPINFRA_API_KEY = "..."
-# (falls back to the DEEPINFRA_API_KEY environment variable for local dev)
+#   OPENROUTER_API_KEY = "sk-or-..."
+# (falls back to the OPENROUTER_API_KEY environment variable for local dev)
 
-DEEPINFRA_URL = "https://api.deepinfra.com/v1/openai/chat/completions"
-DEEPINFRA_MODEL = "deepseek-ai/DeepSeek-V3"  # DeepInfra model id
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODEL = "deepseek/deepseek-v4-flash"
+US_PROVIDERS = ["deepinfra", "fireworks", "together"]  # preferred order
 
 
-def deepinfra_api_key() -> str:
+def openrouter_api_key() -> str:
     try:
-        if "DEEPINFRA_API_KEY" in st.secrets:
-            return str(st.secrets["DEEPINFRA_API_KEY"]).strip()
+        if "OPENROUTER_API_KEY" in st.secrets:
+            return str(st.secrets["OPENROUTER_API_KEY"]).strip()
     except Exception:
         pass  # no secrets file — fall back to the environment
-    return os.environ.get("DEEPINFRA_API_KEY", "").strip()
+    return os.environ.get("OPENROUTER_API_KEY", "").strip()
 
 
 def call_ai(prompt: str, system: str, temperature: float = 0.0) -> str:
-    api_key = deepinfra_api_key()
+    api_key = openrouter_api_key()
     if not api_key:
-        raise RuntimeError("No DeepInfra API key found — add DEEPINFRA_API_KEY "
+        raise RuntimeError("No OpenRouter API key found — add OPENROUTER_API_KEY "
                            "to Streamlit Secrets.")
     resp = requests.post(
-        DEEPINFRA_URL,
+        OPENROUTER_URL,
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            "HTTP-Referer": "https://streamlit.io",
+            "X-Title": "Course Content Checker",
         },
         json={
-            "model": DEEPINFRA_MODEL,
+            "model": OPENROUTER_MODEL,
             "temperature": temperature,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
             ],
+            # pin to US hosts: DeepInfra preferred; never any other provider
+            "provider": {
+                "order": US_PROVIDERS,
+                "only": US_PROVIDERS,
+                "allow_fallbacks": False,
+            },
         },
         timeout=180,
     )
@@ -984,7 +995,7 @@ def process_spec(url: str, force: bool = False, use_ai_fallback: bool = True) ->
         text = spec_bytes_to_text(data, url)
 
         entry = heuristic_entry_section(text)
-        if use_ai_fallback and deepinfra_api_key():
+        if use_ai_fallback and openrouter_api_key():
             if not entry or len(entry) < 40:
                 # heuristic found nothing — let the AI search the document
                 entry = ai_extract_entry(text)
@@ -1004,7 +1015,7 @@ def process_spec(url: str, force: bool = False, use_ai_fallback: bool = True) ->
         # MoA section does not fail the whole spec (ER remains the primary
         # check) — the MoA check will simply report it as unavailable.
         moa = heuristic_moa_section(text)
-        if use_ai_fallback and deepinfra_api_key():
+        if use_ai_fallback and openrouter_api_key():
             if not moa or len(moa) < 40:
                 try:
                     moa = ai_extract_moa(text)
@@ -1319,7 +1330,7 @@ st.set_page_config(page_title="Course Content Checker", page_icon="💜",
 init_db()
 styles.inject()
 
-page = app_sidebar.render(APP_VERSION, bool(deepinfra_api_key()))
+page = app_sidebar.render(APP_VERSION, bool(openrouter_api_key()))
 
 
 def badge(result: str) -> str:
@@ -1453,8 +1464,8 @@ elif page == "▶️ Run Check":
                    "compare the page against the Excel tracker only.")
 
     if st.button("▶️ Run Check", type="primary"):
-        if not deepinfra_api_key():
-            st.error("No DeepInfra API key found — add DEEPINFRA_API_KEY to "
+        if not openrouter_api_key():
+            st.error("No OpenRouter API key found — add OPENROUTER_API_KEY to "
                      "Streamlit Secrets.")
             st.stop()
         try:
@@ -1707,8 +1718,8 @@ elif page == "✍️ Content Quality":
             st.text_area("Loaded content", text, height=180)
 
     if st.button("✍️ Review content quality", type="primary", disabled=not text.strip()):
-        if not deepinfra_api_key():
-            st.error("No DeepInfra API key found — add DEEPINFRA_API_KEY to "
+        if not openrouter_api_key():
+            st.error("No OpenRouter API key found — add OPENROUTER_API_KEY to "
                      "Streamlit Secrets.")
         else:
             with st.spinner("Proofreading …"):

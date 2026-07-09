@@ -25,9 +25,9 @@ def render(version: str, api_key_present: bool) -> str:
 
         st.markdown("")
         if api_key_present:
-            st.success("🔑 DeepInfra connected", icon="✅")
+            st.success("🔑 OpenRouter connected (US hosts)", icon="✅")
         else:
-            st.error("Add `DEEPINFRA_API_KEY` to Streamlit Secrets", icon="🔑")
+            st.error("Add `OPENROUTER_API_KEY` to Streamlit Secrets", icon="🔑")
 
         st.markdown(
             f"""
