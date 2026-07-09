@@ -35,6 +35,7 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -592,37 +593,68 @@ def openrouter_api_key() -> str:
     return os.environ.get("OPENROUTER_API_KEY", "").strip()
 
 
+# gentle client-side pacing + automatic retry, because each check makes
+# several AI calls in a burst and OpenRouter rate-limits by account tier
+_MIN_CALL_GAP = 1.2      # seconds between requests
+_MAX_RETRIES = 5         # attempts on 429 / 5xx before giving up
+_last_call_ts = [0.0]
+
+
 def call_ai(prompt: str, system: str, temperature: float = 0.0) -> str:
     api_key = openrouter_api_key()
     if not api_key:
         raise RuntimeError("No OpenRouter API key found — add OPENROUTER_API_KEY "
                            "to Streamlit Secrets.")
-    resp = requests.post(
-        OPENROUTER_URL,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://streamlit.io",
-            "X-Title": "Course Content Checker",
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "temperature": temperature,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
+        # pin to US hosts: DeepInfra preferred; never any other provider
+        "provider": {
+            "order": US_PROVIDERS,
+            "only": US_PROVIDERS,
+            "allow_fallbacks": False,
         },
-        json={
-            "model": OPENROUTER_MODEL,
-            "temperature": temperature,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt},
-            ],
-            # pin to US hosts: DeepInfra preferred; never any other provider
-            "provider": {
-                "order": US_PROVIDERS,
-                "only": US_PROVIDERS,
-                "allow_fallbacks": False,
-            },
-        },
-        timeout=180,
-    )
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://streamlit.io",
+        "X-Title": "Course Content Checker",
+    }
+
+    last_resp = None
+    for attempt in range(_MAX_RETRIES):
+        # pace requests so bursts don't trip the per-minute limit
+        gap = _MIN_CALL_GAP - (time.time() - _last_call_ts[0])
+        if gap > 0:
+            time.sleep(gap)
+        resp = requests.post(OPENROUTER_URL, headers=headers, json=payload,
+                             timeout=180)
+        _last_call_ts[0] = time.time()
+        last_resp = resp
+        if resp.status_code == 429 or resp.status_code >= 500:
+            # honour Retry-After when present, else exponential backoff
+            try:
+                wait = float(resp.headers.get("Retry-After", ""))
+            except (TypeError, ValueError):
+                wait = 2.0 * (2 ** attempt)          # 2, 4, 8, 16, 32 s
+            time.sleep(min(wait, 45))
+            continue
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+    # retries exhausted — raise a helpful error
+    if last_resp is not None and last_resp.status_code == 429:
+        raise RuntimeError(
+            "OpenRouter rate limit (429) persisted after retries. Wait a "
+            "minute and try again — or add credits to your OpenRouter "
+            "account to raise the per-minute/day limits.")
+    last_resp.raise_for_status()
+    return ""
 
 
 def parse_json_reply(raw: str) -> dict:
