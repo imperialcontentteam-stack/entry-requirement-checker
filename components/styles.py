@@ -34,7 +34,8 @@ p, li, label, .stMarkdown, .stCaption, div[data-testid="stWidgetLabel"] p {{ col
 header[data-testid="stHeader"] {{ background:transparent; box-shadow:none; }}
 header[data-testid="stHeader"] * {{ color:{MUTED}; }}
 #MainMenu, footer {{ visibility:hidden; }}
-div[data-testid="stToolbar"], .stDeployButton, a[data-testid="stAppDeployButton"] {{ display:none; }}
+/* Keep the toolbar container: Streamlit puts the sidebar reopen button inside it. */
+.stDeployButton, a[data-testid="stAppDeployButton"] {{ display:none; }}
 div[data-testid="stDecoration"] {{ display:none; }}
 
 /* ── Fade-in animation for main content ──────── */
