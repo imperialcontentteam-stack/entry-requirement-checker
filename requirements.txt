@@ -7,3 +7,4 @@ pdfplumber
 python-docx
 reportlab
 libsql
+pypdf

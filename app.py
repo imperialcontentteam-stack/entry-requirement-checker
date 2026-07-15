@@ -40,6 +40,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urljoin, urlparse, parse_qsl, urlencode, urlunparse
 
 import pandas as pd
 import requests
@@ -266,11 +267,12 @@ USER_AGENT = {
 }
 
 # status colours (aligned with the purple theme palette)
-RED = "#EF4444"
-GREEN = "#22C55E"
-AMBER = "#F59E0B"
+RED = "#DC2626"
+GREEN = "#16A34A"
+AMBER = "#D97706"
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.1"
+EXTRACTION_VERSION = "2.0.3-pdf1"
 
 # ═══════════════════════════════════════════════════════════════════
 #  DATABASE
@@ -320,7 +322,8 @@ def init_db():
         entry_req     TEXT,
         status        TEXT DEFAULT 'pending',   -- pending | ok | error
         error         TEXT,
-        extracted_at  TEXT
+        extracted_at  TEXT,
+        extractor_version TEXT
     );
     CREATE TABLE IF NOT EXISTS reports (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -341,6 +344,7 @@ def init_db():
         "ALTER TABLE specs ADD COLUMN entry_req_formatted TEXT",
         # Method of Assessment check
         "ALTER TABLE specs ADD COLUMN moa TEXT",
+        "ALTER TABLE specs ADD COLUMN extractor_version TEXT",
         "ALTER TABLE reports ADD COLUMN page_moa TEXT",
         "ALTER TABLE reports ADD COLUMN spec_moa TEXT",
         "ALTER TABLE reports ADD COLUMN moa_issues_json TEXT",
@@ -525,45 +529,197 @@ def _drive_file_id(url: str):
     return None
 
 
+def _normalise_document_bytes(data: bytes) -> bytes:
+    """Trim harmless bytes before a PDF header.
+
+    Some document servers prepend a UTF-8 BOM, whitespace, or a short proxy
+    banner before ``%PDF``. Browsers tolerate this, but strict type checks do
+    not. Only trim when the real header appears near the beginning.
+    """
+    if not data:
+        return data
+    idx = data[:4096].find(b"%PDF-")
+    if idx > 0:
+        return data[idx:]
+    return data
+
+
+def _looks_like_html(data: bytes, content_type: str = "") -> bool:
+    head = (data or b"")[:8000].lstrip().lower()
+    ctype = (content_type or "").lower()
+    return ("text/html" in ctype or "application/xhtml" in ctype
+            or head.startswith(b"<!doctype html") or head.startswith(b"<html")
+            or b"<html" in head[:1000])
+
+
+def _html_access_problem(data: bytes):
+    """Explain common cases where a browser page is returned, not a file."""
+    text = BeautifulSoup((data or b"").decode("utf-8", errors="ignore"),
+                         "html.parser").get_text(" ", strip=True).lower()
+    sample = text[:12000]
+    if any(x in sample for x in (
+            "sign in to continue", "please sign in", "log in to continue",
+            "authentication required", "you must be logged in")):
+        return ("The link opens only for a signed-in browser. The app has no "
+                "access to your browser cookies; publish the document for "
+                "anonymous access or use a direct public download link.")
+    if any(x in sample for x in (
+            "access denied", "request access", "you do not have permission",
+            "you need permission", "unauthorized", "forbidden")):
+        return ("The document server denied anonymous access. Set the file to "
+                "public/'Anyone with the link' or provide a direct public link.")
+    if any(x in sample for x in (
+            "checking your browser", "verify you are human", "captcha",
+            "enable javascript and cookies", "cloudflare")):
+        return ("The site returned an anti-bot/JavaScript challenge instead of "
+                "the document. A direct public PDF link is required.")
+    return None
+
+
+def _embedded_document_url(data: bytes, base_url: str):
+    """Find a PDF/DOCX embedded in a browser viewer or landing page."""
+    try:
+        soup = BeautifulSoup(data.decode("utf-8", errors="ignore"), "html.parser")
+    except Exception:
+        return None
+
+    raw = []
+    for tag, attr in (("embed", "src"), ("object", "data"),
+                      ("iframe", "src"), ("a", "href")):
+        for node in soup.find_all(tag):
+            value = node.get(attr)
+            if value:
+                raw.append(value)
+    for node in soup.find_all("meta"):
+        value = node.get("content")
+        if value:
+            raw.append(value)
+
+    # Prefer explicit document-looking URLs. Ignore javascript/data URLs and
+    # the original landing page to prevent loops.
+    base_no_frag = (base_url or "").split("#", 1)[0]
+    candidates = []
+    for value in raw:
+        value = str(value).strip().replace("&amp;", "&")
+        if not value or value.lower().startswith(("javascript:", "data:")):
+            continue
+        absolute = urljoin(base_url, value).split("#", 1)[0]
+        if absolute == base_no_frag:
+            continue
+        low = absolute.lower()
+        score = 0
+        if re.search(r"\.(pdf|docx?)(?:$|[?#])", low):
+            score += 10
+        if any(k in low for k in ("download=1", "download=true", "export=download",
+                                  "format=pdf", "/download")):
+            score += 5
+        if score:
+            candidates.append((score, absolute))
+    return max(candidates, default=(0, None))[1]
+
+
+def _with_query_param(url: str, key: str, value: str) -> str:
+    parts = urlparse(url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query[key] = value
+    return urlunparse(parts._replace(query=urlencode(query)))
+
+
+def _ordinary_download_candidates(url: str) -> list[str]:
+    """Return common direct-download variants before the original URL."""
+    out = []
+    host = urlparse(url or "").netloc.lower()
+    if "dropbox.com" in host:
+        out.append(_with_query_param(url, "dl", "1"))
+    if any(x in host for x in ("sharepoint.com", "1drv.ms", "onedrive.live.com")):
+        out.append(_with_query_param(url, "download", "1"))
+    out.append(url)
+    # Preserve order while removing duplicates.
+    return list(dict.fromkeys(x for x in out if x))
+
+
+def _get_document_response(url: str, *, referer: str = ""):
+    """GET a document with limited retry and clearer HTTP errors."""
+    headers = dict(USER_AGENT)
+    headers.update({
+        "Accept": ("application/pdf,application/vnd.openxmlformats-officedocument."
+                   "wordprocessingml.document,text/html;q=0.8,*/*;q=0.5"),
+        "Accept-Language": "en-GB,en;q=0.9",
+    })
+    if referer:
+        headers["Referer"] = referer
+
+    last = None
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, headers=headers, timeout=(20, 90),
+                                allow_redirects=True)
+            if resp.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                time.sleep(0.8 * (attempt + 1))
+                last = resp
+                continue
+            if resp.status_code in (401, 403):
+                raise RuntimeError(
+                    f"Document server returned HTTP {resp.status_code}. The link "
+                    "may work in your browser because you are signed in, but the "
+                    "app needs an anonymously accessible direct download link.")
+            if resp.status_code == 404:
+                raise RuntimeError("Document server returned HTTP 404 (file not found).")
+            resp.raise_for_status()
+            return resp
+        except requests.RequestException as exc:
+            last = exc
+            if attempt < 2:
+                time.sleep(0.8 * (attempt + 1))
+                continue
+            raise RuntimeError(f"Could not download the document: {exc}") from exc
+    if hasattr(last, "raise_for_status"):
+        last.raise_for_status()
+    raise RuntimeError("Could not download the document.")
+
+
 def _drive_html_problem(data: bytes):
     """If Drive returned an HTML page instead of the file, say why."""
-    head = data[:6000]
-    if b"<html" not in head.lower() and b"<!doctype" not in head.lower():
+    head = data[:12000]
+    if not _looks_like_html(head):
         return None
     low = head.lower()
     if b"virus scan warning" in low or b"confirm=" in low:
         return "scan-page"          # bypassable — handled by caller
-    if b"you can't view or download" in low or b"sorry" in low and b"download" in low:
-        return ("Google Drive refused the download — open the file's Share "
-                "settings and set it to 'Anyone with the link'.")
-    if b"accounts.google.com" in low or b"sign in" in low:
-        return ("Google Drive link requires sign-in — set the file's sharing "
-                "to 'Anyone with the link'.")
+    generic = _html_access_problem(data)
+    if generic:
+        return generic
     if b"too many users have viewed or downloaded" in low or b"quota" in low:
         return ("Google Drive download quota exceeded for this file — try "
                 "again later or re-upload a copy.")
     if b"file does not exist" in low or b"not found" in low:
         return "Google Drive file not found — the link may be broken."
-    return ("Google Drive returned a web page instead of the document — "
-            "check the link is a direct file share set to 'Anyone with the link'.")
+    return ("Google Drive returned a viewer page instead of the document. "
+            "Set sharing to 'Anyone with the link' and use a file share link.")
 
 
 def fetch_spec_bytes(url: str) -> bytes:
-    """Download a specification document. Handles Google Drive share links
-    (including large files behind the virus-scan page and Google Docs
-    native documents), plus ordinary PDF/DOCX/web-page URLs."""
+    """Download a PDF, DOCX, or specification web page reliably.
+
+    Supports Google Drive/Docs, common cloud-share direct-download variants,
+    and HTML viewer pages that contain an embedded PDF link.
+    """
+    if not (url or "").strip():
+        raise RuntimeError("No specification document URL was provided.")
+
     # Google Docs native document → export as PDF
     m = re.search(r"docs\.google\.com/document/d/([^/?#]+)", url or "")
     if m:
         u = f"https://docs.google.com/document/d/{m.group(1)}/export?format=pdf"
-        resp = requests.get(u, headers=USER_AGENT, timeout=90, allow_redirects=True)
-        resp.raise_for_status()
-        return resp.content
+        resp = _get_document_response(u, referer=url)
+        data = _normalise_document_bytes(resp.content)
+        issue = _drive_html_problem(data)
+        if issue:
+            raise RuntimeError(issue)
+        return data
 
     fid = _drive_file_id(url)
     if fid:
-        # modern endpoint first (confirm=t skips the virus-scan page),
-        # legacy endpoint as backup
         candidates = [
             f"https://drive.usercontent.google.com/download?id={fid}"
             f"&export=download&confirm=t",
@@ -571,58 +727,193 @@ def fetch_spec_bytes(url: str) -> bytes:
         ]
         problem = None
         for u in candidates:
-            resp = requests.get(u, headers=USER_AGENT, timeout=90,
-                                allow_redirects=True)
-            if not resp.ok:
-                problem = f"HTTP {resp.status_code} from Google Drive"
+            try:
+                resp = _get_document_response(u, referer=url)
+            except Exception as exc:
+                problem = str(exc)
                 continue
-            issue = _drive_html_problem(resp.content)
+            data = _normalise_document_bytes(resp.content)
+            issue = _drive_html_problem(data)
             if issue is None:
-                return resp.content
+                return data
             if issue == "scan-page":
-                # old-style scan page: scrape the confirm link and retry
-                mm = re.search(rb'href="([^"]*confirm=[^"]*)"', resp.content)
+                mm = re.search(rb'href="([^"]*confirm=[^"]*)"', data)
                 if mm:
                     cu = mm.group(1).decode().replace("&amp;", "&")
                     if cu.startswith("/"):
                         cu = "https://drive.google.com" + cu
-                    r2 = requests.get(cu, headers=USER_AGENT, timeout=90)
-                    if r2.ok and _drive_html_problem(r2.content) is None:
-                        return r2.content
-                problem = "could not pass the Drive virus-scan page"
+                    try:
+                        r2 = _get_document_response(cu, referer=url)
+                        data2 = _normalise_document_bytes(r2.content)
+                        if _drive_html_problem(data2) is None:
+                            return data2
+                    except Exception as exc:
+                        problem = str(exc)
+                problem = problem or "Could not pass the Google Drive scan page."
             else:
                 problem = issue
-        raise RuntimeError(problem or "Google Drive download failed")
+        raise RuntimeError(problem or "Google Drive download failed.")
 
-    # not a Drive link — fetch directly (PDF, DOCX or a spec web page)
-    resp = requests.get(url, headers=USER_AGENT, timeout=90, allow_redirects=True)
-    resp.raise_for_status()
-    return resp.content
+    # Ordinary links. Try cloud-provider direct download variants first.
+    problems = []
+    for candidate in _ordinary_download_candidates(url):
+        try:
+            resp = _get_document_response(candidate, referer=url if candidate != url else "")
+        except Exception as exc:
+            problems.append(str(exc))
+            continue
+        data = _normalise_document_bytes(resp.content)
+        ctype = resp.headers.get("Content-Type", "")
+
+        if data.startswith((b"%PDF-", b"PK")):
+            return data
+
+        if _looks_like_html(data, ctype):
+            access_problem = _html_access_problem(data)
+            nested = _embedded_document_url(data, resp.url or candidate)
+            if nested:
+                try:
+                    nested_resp = _get_document_response(nested,
+                                                         referer=resp.url or candidate)
+                    nested_data = _normalise_document_bytes(nested_resp.content)
+                    if nested_data.startswith((b"%PDF-", b"PK")):
+                        return nested_data
+                    if not _looks_like_html(
+                            nested_data, nested_resp.headers.get("Content-Type", "")):
+                        return nested_data
+                except Exception as exc:
+                    problems.append(f"Embedded document download failed: {exc}")
+            if access_problem:
+                problems.append(access_problem)
+                continue
+            # A genuine specification web page is valid input.
+            return data
+
+        # Plain text and unusual but readable formats are passed through to the
+        # text converter, which provides the final type/error diagnosis.
+        return data
+
+    raise RuntimeError(problems[-1] if problems else "Document download failed.")
+
+
+def _extract_pdf_with_pdfplumber(data: bytes, max_chars: int) -> tuple[str, int]:
+    import pdfplumber
+    parts = []
+    pages = 0
+    with pdfplumber.open(io.BytesIO(data)) as pdf:
+        pages = len(pdf.pages)
+        for page in pdf.pages:
+            parts.append(page.extract_text(x_tolerance=2, y_tolerance=3) or "")
+            if sum(len(p) for p in parts) > max_chars:
+                break
+    return "\n".join(parts)[:max_chars], pages
+
+
+def _extract_pdf_with_pypdf(data: bytes, max_chars: int) -> tuple[str, int]:
+    """Fallback for PDFs that pdfplumber/pdfminer cannot parse well."""
+    from pypdf import PdfReader
+    reader = PdfReader(io.BytesIO(data), strict=False)
+    if reader.is_encrypted:
+        try:
+            result = reader.decrypt("")
+        except Exception as exc:
+            raise RuntimeError(
+                "The PDF is password-protected and cannot be extracted.") from exc
+        if result == 0:
+            raise RuntimeError(
+                "The PDF is password-protected and cannot be extracted.")
+    parts = []
+    for page in reader.pages:
+        try:
+            parts.append(page.extract_text() or "")
+        except Exception:
+            parts.append("")
+        if sum(len(p) for p in parts) > max_chars:
+            break
+    return "\n".join(parts)[:max_chars], len(reader.pages)
 
 
 def spec_bytes_to_text(data: bytes, url: str = "", max_chars: int = 150000) -> str:
-    """PDF / DOCX / HTML → plain text."""
-    if data.startswith(b"%PDF"):
-        import pdfplumber
-        parts = []
-        with pdfplumber.open(io.BytesIO(data)) as pdf:
-            for page in pdf.pages:
-                parts.append(page.extract_text() or "")
-                if sum(len(p) for p in parts) > max_chars:
-                    break
-        return "\n".join(parts)[:max_chars]
+    """Convert PDF / DOCX / HTML / text bytes into plain text.
+
+    PDF extraction uses two independent engines. A clear error is returned for
+    scanned/image-only or protected PDFs instead of silently caching blank text.
+    """
+    data = _normalise_document_bytes(data)
+    if not data:
+        raise RuntimeError("The downloaded document is empty.")
+
+    if data.startswith(b"%PDF-"):
+        attempts = []
+        best_text = ""
+        page_count = 0
+        try:
+            text, pages = _extract_pdf_with_pdfplumber(data, max_chars)
+            best_text, page_count = text, max(page_count, pages)
+        except Exception as exc:
+            attempts.append(f"pdfplumber: {exc}")
+        try:
+            text, pages = _extract_pdf_with_pypdf(data, max_chars)
+            page_count = max(page_count, pages)
+            if len(re.sub(r"\s+", "", text)) > len(re.sub(r"\s+", "", best_text)):
+                best_text = text
+        except Exception as exc:
+            attempts.append(f"pypdf: {exc}")
+
+        clean_len = len(re.sub(r"\s+", "", best_text))
+        if clean_len < 30:
+            protected = next((x for x in attempts if "password-protected" in x), None)
+            if protected:
+                raise RuntimeError("The PDF is password-protected and cannot be extracted.")
+            if page_count:
+                raise RuntimeError(
+                    f"The PDF downloaded and opened ({page_count} page(s)), but it "
+                    "contains no usable machine-readable text. It is probably a "
+                    "scanned/image-only PDF. Convert it to a searchable/OCR PDF "
+                    "or upload a text-based copy.")
+            detail = "; ".join(attempts)[:500]
+            raise RuntimeError(
+                "The file looks like a PDF but could not be parsed. "
+                + (f"Parser details: {detail}" if detail else
+                   "It may be damaged or use an unsupported PDF structure."))
+        return best_text[:max_chars]
+
     if data.startswith(b"PK"):
         from docx import Document
-        d = Document(io.BytesIO(data))
+        try:
+            d = Document(io.BytesIO(data))
+        except Exception as exc:
+            raise RuntimeError(
+                "The downloaded ZIP-based file is not a readable DOCX document.") from exc
         parts = [p.text for p in d.paragraphs]
         for table in d.tables:
             for row in table.rows:
                 parts.append(" | ".join(cell.text.strip() for cell in row.cells))
-        return "\n".join(p for p in parts if p and p.strip())[:max_chars]
-    soup = BeautifulSoup(data.decode("utf-8", errors="ignore"), "html.parser")
-    for tag in soup(["script", "style", "nav", "footer", "header", "noscript"]):
-        tag.decompose()
-    return soup.get_text("\n", strip=True)[:max_chars]
+        text = "\n".join(p for p in parts if p and p.strip())[:max_chars]
+        if not text.strip():
+            raise RuntimeError("The DOCX opened but contained no extractable text.")
+        return text
+
+    if _looks_like_html(data):
+        problem = _html_access_problem(data)
+        if problem:
+            raise RuntimeError(problem)
+        soup = BeautifulSoup(data.decode("utf-8", errors="ignore"), "html.parser")
+        for tag in soup(["script", "style", "nav", "footer", "header", "noscript"]):
+            tag.decompose()
+        text = soup.get_text("\n", strip=True)[:max_chars]
+        if len(re.sub(r"\s+", "", text)) < 30:
+            raise RuntimeError(
+                "The link returned a web viewer/landing page with no extractable "
+                "document text. Use the viewer's direct Download link.")
+        return text
+
+    # Last-resort plain-text decoding for servers that omit or mislabel MIME.
+    text = data.decode("utf-8", errors="ignore")[:max_chars]
+    if len(re.sub(r"\s+", "", text)) < 30:
+        raise RuntimeError(
+            "The downloaded file is not a recognised text PDF, DOCX, or HTML document.")
+    return text
 
 
 ENTRY_HEADING = r"entry\s+requirements?|entry\s+criteria|admission\s+requirements?"
@@ -721,41 +1012,147 @@ _PAGE_BOILERPLATE = (r"not sure if this course|speak to an advisor"
                      r"|average completion timeframe|\b0\d{2}[- ]\d{4}[- ]\d{4}\b")
 
 
+def _normalise_heading_text(text: str) -> str:
+    """Collapse whitespace so heading comparisons are exact and predictable."""
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def _matches_heading(text: str, pattern: str) -> bool:
+    text = _normalise_heading_text(text)
+    return bool(text and re.fullmatch(rf"(?:{pattern})\s*:?\s*", text, re.I))
+
+
+def _is_heading_node(node, pattern: str) -> bool:
+    """Return True only when *node itself* looks like a section heading.
+
+    The old extractor used ``re.match`` against every short sibling. That made
+    ordinary requirement lines such as "Qualifications at Level 3 ..." look
+    like a new "Qualification" section and silently truncated the result.
+    """
+    if node is None or not getattr(node, "name", None):
+        return False
+    text = _normalise_heading_text(node.get_text(" ", strip=True))
+    if not _matches_heading(text, pattern):
+        return False
+    if node.name in {"h1", "h2", "h3", "h4", "h5", "h6", "button", "summary"}:
+        return True
+    role = str(node.attrs.get("role", "")).lower()
+    classes = " ".join(node.attrs.get("class", [])).lower()
+    if role in {"heading", "button", "tab"}:
+        return True
+    if any(word in classes for word in ("heading", "title", "accordion", "tab")):
+        return True
+    # Some CMSs use a plain <strong>/<b>/<p>/<div> as a heading. Exact full
+    # matching keeps this safe; body lines with extra wording cannot match.
+    return node.name in {"strong", "b", "p", "div", "span", "a"} and len(text) < 90
+
+
+def _clean_section_candidate(text: str, heading_re: str) -> str:
+    text = re.sub(r"\n{3,}", "\n\n", text or "").strip()
+    text = re.sub(rf"^\s*(?:{heading_re})\s*:?\s*", "", text, flags=re.I)
+    return text.strip()[:4000]
+
+
+def _accordion_target(soup, heading) -> str:
+    """Read content referenced by an accordion/tab heading when available."""
+    ids = []
+    for attr in ("aria-controls", "data-target", "data-bs-target", "href"):
+        value = heading.attrs.get(attr)
+        if isinstance(value, str) and value.startswith("#"):
+            ids.append(value[1:])
+        elif attr == "aria-controls" and isinstance(value, str):
+            ids.append(value)
+    for target_id in ids:
+        target = soup.find(id=target_id)
+        if target is not None:
+            return target.get_text("\n", strip=True)
+    return ""
+
+
 def _page_section(soup, heading_re: str, next_re: str) -> str:
-    """Find a section on a course page by its heading and collect the
-    content that follows it (handles accordion/tab layouts)."""
-    heading = None
-    for h in soup.find_all(["h1", "h2", "h3", "h4", "h5", "strong", "b",
-                            "button", "a", "span", "div"]):
-        t = h.get_text(" ", strip=True)
-        if t and len(t) < 60 and re.fullmatch(rf"(?:{heading_re})\s*:?", t, re.I):
-            heading = h
-            break
-    if heading is None:
+    """Extract the most complete matching course-page section.
+
+    Supports ordinary headings, nested cards, and accordion/tab controls. All
+    matching headings are considered and the best body candidate is selected,
+    avoiding menu/summary duplicates that appear before the real content.
+    """
+    candidates = []
+    heading_tags = ["h1", "h2", "h3", "h4", "h5", "h6", "strong", "b",
+                    "button", "summary", "a", "span", "p", "div"]
+    headings = []
+    for h in soup.find_all(heading_tags):
+        text = _normalise_heading_text(h.get_text(" ", strip=True))
+        if len(text) < 90 and _matches_heading(text, heading_re):
+            headings.append(h)
+
+    for heading in headings:
+        # 1) Explicit accordion / tab target.
+        target_text = _accordion_target(soup, heading)
+        if target_text:
+            candidates.append(_clean_section_candidate(target_text, heading_re))
+
+        # 2) Siblings at the heading level. Stop only at a genuine heading node
+        # whose complete text matches the next-section pattern.
+        parts = []
+        node = heading
+        for _ in range(35):
+            node = node.find_next_sibling()
+            if node is None:
+                break
+            if _is_heading_node(node, next_re):
+                break
+            text = node.get_text("\n", strip=True)
+            if text:
+                parts.append(text)
+            if sum(len(part) for part in parts) > 4000:
+                break
+        if parts:
+            candidates.append(_clean_section_candidate("\n".join(parts), heading_re))
+
+        # 3) Nested card/accordion layouts where heading and content share a
+        # parent. Try a few ancestor levels, but reject containers that include
+        # another recognised section heading after the current one.
+        parent = heading.parent
+        for _ in range(3):
+            if parent is None or getattr(parent, "name", None) in {"body", "main", "article"}:
+                break
+            parent_text = parent.get_text("\n", strip=True)
+            cleaned = _clean_section_candidate(parent_text, heading_re)
+            if cleaned and len(cleaned) > 20:
+                # Trim at an exact next heading line if the container holds
+                # multiple sections.
+                lines = cleaned.splitlines()
+                kept = []
+                for line in lines:
+                    if _matches_heading(line, next_re):
+                        break
+                    kept.append(line)
+                candidates.append("\n".join(kept).strip()[:4000])
+            parent = parent.parent
+
+    trimmed_candidates = []
+    for candidate in candidates:
+        kept = []
+        for line in candidate.splitlines():
+            if _matches_heading(line, next_re):
+                break
+            kept.append(line)
+        value = "\n".join(kept).strip()[:4000]
+        if value and len(value) >= 15:
+            trimmed_candidates.append(value)
+    candidates = trimmed_candidates
+    if not candidates:
         return ""
-    parts = []
-    node = heading
-    for _ in range(12):
-        node = node.find_next_sibling()
-        if node is None:
-            break
-        t = node.get_text("\n", strip=True)
-        if not t:
-            continue
-        # stop at the next section heading / trailing boilerplate
-        if re.match(rf"(?:{next_re})", t, re.I) and len(t) < 90:
-            break
-        parts.append(t)
-        if sum(len(p) for p in parts) > 3500:
-            break
-    section = "\n".join(parts).strip()
-    if not section:  # content nested inside the parent (accordion item)
-        parent = heading.find_parent()
-        if parent is not None:
-            t = parent.get_text("\n", strip=True)
-            t = re.sub(rf"^\s*(?:{heading_re})\s*:?\s*", "", t, flags=re.I)
-            section = t.strip()[:4000]
-    return section
+
+    # Prefer informative, complete candidates without rewarding duplicated
+    # navigation text. Length is the main signal, with line diversity as a tie
+    # breaker.
+    def score(value: str):
+        lines = [ln.strip() for ln in value.splitlines() if ln.strip()]
+        unique = len(dict.fromkeys(lines))
+        return (min(len(value), 4000), unique)
+
+    return max(candidates, key=score)
 
 
 def _trim_boilerplate(text: str) -> str:
@@ -767,8 +1164,16 @@ def extract_page_sections(url: str) -> tuple:
     from a course page, fetched once. Heading-based extraction handles the
     usual layouts; when it fails, a heuristic runs on the flattened text,
     and the caller can still fall back to sending full_page_text to the AI."""
-    resp = requests.get(url, headers=USER_AGENT, timeout=60, allow_redirects=True)
-    resp.raise_for_status()
+    try:
+        resp = requests.get(url, headers=USER_AGENT, timeout=60,
+                            allow_redirects=True)
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"Could not open the course page URL: {url}. "
+            f"The site may be blocking automated access or the URL may be "
+            f"unavailable. Details: {exc}"
+        ) from exc
     soup = BeautifulSoup(resp.text, "html.parser")
     for tag in soup(["script", "style", "nav", "footer", "header", "noscript", "form"]):
         tag.decompose()
@@ -777,7 +1182,9 @@ def extract_page_sections(url: str) -> tuple:
     moa = _page_section(soup, MOA_HEADING, PAGE_NEXT_AFTER_MOA)
 
     main = soup.find("main") or soup.find("article") or soup.body or soup
-    full_text = re.sub(r"\n{3,}", "\n\n", main.get_text("\n", strip=True))[:14000]
+    # Retain a wider text window. The AI helper below focuses around the
+    # relevant heading before sending at most 14k characters to the model.
+    full_text = re.sub(r"\n{3,}", "\n\n", main.get_text("\n", strip=True))[:40000]
 
     if not entry:
         entry = heuristic_entry_section(full_text)
@@ -785,6 +1192,38 @@ def extract_page_sections(url: str) -> tuple:
         moa = heuristic_moa_section(full_text)
 
     return _trim_boilerplate(entry), _trim_boilerplate(moa), full_text
+
+
+def section_ai_window(text: str, heading_re: str, max_chars: int = 14000) -> str:
+    """Focus a long page around a requested section before AI extraction."""
+    text = text or ""
+    matches = list(re.finditer(heading_re, text, re.I))
+    if not matches:
+        return text[:max_chars]
+    # Navigation/header/footer elements were already removed from the page;
+    # when a CMS repeats the label inside the main content, the later match is
+    # usually the expanded section rather than a summary link.
+    match = matches[-1]
+    start = max(0, match.start() - 800)
+    return text[start:start + max_chars]
+
+
+def reconcile_section(primary: str, ai_value: str) -> str:
+    """Choose the more complete extraction without replacing good DOM text
+    with a tiny or obviously over-broad AI answer."""
+    primary = _trim_boilerplate(primary)
+    ai_value = _trim_boilerplate(ai_value)
+    if not primary:
+        return ai_value
+    if not ai_value:
+        return primary
+    if len(primary) < 40 and len(ai_value) > len(primary):
+        return ai_value
+    # Require a meaningful completeness gain. Cap protects against an AI reply
+    # that accidentally includes the rest of the page.
+    if len(ai_value) <= 5000 and len(ai_value) >= len(primary) + max(60, int(len(primary) * 0.15)):
+        return ai_value
+    return primary
 
 
 def extract_page_entry(url: str) -> tuple:
@@ -872,8 +1311,31 @@ def call_ai(prompt: str, system: str, temperature: float = 0.0) -> str:
                 wait = 2.0 * (2 ** attempt)          # 2, 4, 8, 16, 32 s
             time.sleep(min(wait, 45))
             continue
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
+        if resp.status_code >= 400:
+            try:
+                payload_error = resp.json().get("error", {})
+                message = payload_error.get("message") or str(payload_error)
+            except Exception:
+                message = (getattr(resp, "text", "") or "").strip()
+            message = message or "No error details were returned."
+            hints = {
+                401: "Check that OPENROUTER_API_KEY is valid and active.",
+                402: "The OpenRouter account has insufficient credits.",
+                403: "The API key does not have permission for this request.",
+                404: "The configured model or endpoint was not found.",
+            }
+            hint = hints.get(resp.status_code, "")
+            raise RuntimeError(
+                f"OpenRouter request failed ({resp.status_code}): {message}"
+                + (f" {hint}" if hint else "")
+            )
+        data = resp.json()
+        try:
+            return data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError(
+                "OpenRouter returned an unexpected response without model text."
+            ) from exc
 
     # retries exhausted — raise a helpful error
     if last_resp is not None and last_resp.status_code == 429:
@@ -945,7 +1407,12 @@ Identify:
 5. Grammar and spelling issues on the course page.
 6. Suggested corrected Entry Requirements for the course page. This MUST be the COMPLETE set of entry requirements from the QUALIFICATION SPECIFICATION: list EVERY requirement point by point (one per line, each line starting with "- "), using the specification's wording exactly as written. Do NOT summarise, shorten, merge or omit ANY requirement from the specification.
 
-Minor stylistic rephrasing that does NOT change meaning is acceptable and should NOT cause a fail. Fail only for missing requirements, incorrect requirements, or meaning-changing wording. Grammar/spelling issues alone do not fail a course, but list them.
+Decision rules:
+* When the qualification specification is available, it is the ONLY authority for the course-page Pass/Fail result. An Excel mismatch must be reported through matches_excel/summary but must not by itself fail the course page.
+* When the qualification specification is unavailable, use the Excel tracker as the fallback authority. State this clearly in the summary.
+* Compare only explicit requirements. Do not invent, infer, or generalise requirements that are not written in the authority source.
+* Preserve exact numbers, ages, grades, scores, test names, AND/OR logic, and mandatory versus recommended wording.
+* Minor stylistic rephrasing that does NOT change meaning is acceptable and should NOT cause a fail. Fail only for missing requirements, incorrect requirements, or meaning-changing wording. Grammar/spelling issues alone do not fail a course, but list them.
 
 Reply with EXACTLY this JSON:
 {{
@@ -1250,7 +1717,8 @@ def process_spec(url: str, force: bool = False, use_ai_fallback: bool = True) ->
         doc_hash = hashlib.sha256(data).hexdigest()
         if (existing and existing["status"] == "ok" and not force
                 and existing["doc_hash"] == doc_hash and existing["entry_req"]
-                and existing.get("moa")):
+                and existing.get("moa")
+                and existing.get("extractor_version") == EXTRACTION_VERSION):
             return {"skipped": True, "status": "ok"}
         text = spec_bytes_to_text(data, url)
 
@@ -1293,6 +1761,7 @@ def process_spec(url: str, force: bool = False, use_ai_fallback: bool = True) ->
 
         save_spec(url, doc_hash=doc_hash, entry_req=entry, moa=moa or "",
                   status="ok", error="", extracted_at=now(),
+                  extractor_version=EXTRACTION_VERSION,
                   entry_req_formatted="")
         return {"skipped": False, "status": "ok"}
     except Exception as e:
@@ -1373,8 +1842,8 @@ def build_pdf(course, report) -> bytes:
     issue_block("Grammar & Spelling Issues", "grammar_spelling")
 
     corrected = strip_excluded_sections(
-        (report["corrected"] or "").strip()
-        or build_corrected_entry(report["spec_entry"], ""))
+        build_corrected_entry(report["spec_entry"],
+                              report["corrected"] or ""))
     story += [Paragraph("Suggested Corrected Entry Requirements "
                         "(complete set from the qualification specification)", h2),
               Paragraph(esc(corrected) or "—", body)]
@@ -1553,9 +2022,9 @@ def annotate_text_html(text: str, issues: list) -> str:
 QR_CSS = """
 <style>
 .qr-paper {
-  background:#FFFDF6; border:1px solid #EDE6D2; border-radius:14px;
+  background:#FFFFFF; border:1px solid #D9E2EC; border-radius:16px;
   padding:26px 30px; line-height:2.05; font-size:1.0rem; color:#2A2F3A;
-  box-shadow: 0 3px 14px rgba(16,36,62,.07);
+  box-shadow: 0 8px 24px rgba(16,42,67,.07);
 }
 .qr-mark { border-radius:4px; padding:1px 3px; cursor:help; position:relative; }
 .qr-num {
@@ -1567,7 +2036,7 @@ QR_CSS = """
   font-size:.78rem; font-weight:600;
 }
 .issue-card {
-  border-radius:12px; border:1px solid #E6E9EF; border-left-width:5px;
+  border-radius:13px; border:1px solid #D9E2EC; border-left-width:5px;
   padding:12px 16px; margin-bottom:10px; background:#fff;
 }
 .issue-card .cat { font-size:.72rem; font-weight:700; text-transform:uppercase; letter-spacing:.08em;}
@@ -1585,10 +2054,16 @@ def qr_stat(col, value, label, kind="info"):
 #  UI
 # ═══════════════════════════════════════════════════════════════════
 
-st.set_page_config(page_title="Course Content Checker", page_icon="💜",
+st.set_page_config(page_title="Course Content Checker", page_icon="✅",
                    layout="wide", initial_sidebar_state="expanded")
 init_db()
 styles.inject()
+
+# Open the application on Run Check on the first session load.
+# The value is only seeded once, so subsequent sidebar navigation remains
+# fully user-controlled across Streamlit reruns.
+if "main_navigation" not in st.session_state:
+    st.session_state["main_navigation"] = "▶️ Run Check"
 
 page = app_sidebar.render(APP_VERSION, bool(openrouter_api_key()))
 
@@ -1601,7 +2076,8 @@ def badge(result: str) -> str:
 if page == "📥 Upload & Specs":
     header.page_header("📥 Upload & Specs",
                        "Import the tracker Excel and extract each qualification "
-                       "specification once — everything is cached locally.")
+                       "specification once — everything is cached locally.",
+                       chip="Data preparation")
     st.subheader("Upload Tracker Excel")
     upload_ui.info(".xlsx · .xlsm · .xls",
                    "Columns used: Course Name · Course URL · Specification Document "
@@ -1684,7 +2160,8 @@ elif page == "▶️ Run Check":
     header.page_header("▶️ Run Check",
                        "Audit a course page against its qualification "
                        "specification — Entry Requirements and Method of "
-                       "Assessment in one pass.")
+                       "Assessment in one pass.",
+                       chip="Compliance audit")
     courses = all_courses()
     if not courses:
         st.info("Upload the tracker Excel first (📥 Upload & Specs).")
@@ -1714,7 +2191,9 @@ elif page == "▶️ Run Check":
                 f"**Specification:** {course['spec_url'] or '—'}")
 
     spec_row = get_spec(course["spec_url"]) if course["spec_url"] else None
-    spec_ready = bool(spec_row and spec_row["status"] == "ok" and spec_row["entry_req"])
+    spec_ready = bool(spec_row and spec_row["status"] == "ok"
+                      and spec_row["entry_req"]
+                      and spec_row.get("extractor_version") == EXTRACTION_VERSION)
     if course["spec_url"] and not spec_ready:
         st.warning("This course's specification hasn't been extracted yet — it will "
                    "be processed automatically when you run the check (and cached "
@@ -1723,23 +2202,52 @@ elif page == "▶️ Run Check":
         st.warning("No specification document URL for this course — the check will "
                    "compare the page against the Excel tracker only.")
 
-    if st.button("▶️ Run Check", type="primary"):
-        if not openrouter_api_key():
-            st.error("No OpenRouter API key found — add OPENROUTER_API_KEY to "
-                     "Streamlit Secrets.")
-            st.stop()
+    api_key_ready = bool(openrouter_api_key())
+    if not api_key_ready:
+        st.error(
+            "Run Check is unavailable because `OPENROUTER_API_KEY` is not "
+            "configured. For local use, copy `.streamlit/secrets.toml.example` "
+            "to `.streamlit/secrets.toml` and replace the placeholder key. "
+            "On Streamlit Cloud, add the same setting under App settings → "
+            "Secrets."
+        )
+
+    run_check = st.button(
+        "▶️ Run Check",
+        type="primary",
+        key="run_check_button",
+        disabled=not api_key_ready,
+        help=(None if api_key_ready else
+              "Configure OPENROUTER_API_KEY before running a check."),
+    )
+    if run_check:
         try:
             prog = progress_ui.StepProgress(4, course["name"])
             prog.step(1, "Reading course page")
             with st.spinner("Reading course page…"):
                 page_entry, page_moa, full_text = extract_page_sections(course["course_url"])
+                # Cross-check the page section. This catches accordions/CMS
+                # layouts where a deterministic extraction returns only the
+                # first requirement or stops at a misleading short line.
+                try:
+                    ai_page_entry = ai_extract_entry(
+                        section_ai_window(full_text, ENTRY_HEADING))
+                    page_entry = reconcile_section(page_entry, ai_page_entry)
+                except Exception:
+                    # The main comparison still runs with the deterministic
+                    # extraction if this optional cross-check fails.
+                    pass
                 if not page_entry:
-                    page_entry = ai_extract_entry(full_text)
-                if not page_moa:
-                    try:
-                        page_moa = ai_extract_moa(full_text)
-                    except Exception:
-                        page_moa = ""
+                    raise RuntimeError(
+                        "No Entry Requirements section could be extracted from "
+                        "the course page. Check that the page is publicly "
+                        "accessible and contains an Entry Requirements heading.")
+                try:
+                    ai_page_moa = ai_extract_moa(
+                        section_ai_window(full_text, MOA_HEADING))
+                    page_moa = reconcile_section(page_moa, ai_page_moa)
+                except Exception:
+                    page_moa = page_moa or ""
             spec_entry = spec_moa = ""
             prog.step(2, "Loading specification (cached when possible)")
             if course["spec_url"]:
@@ -1767,37 +2275,25 @@ elif page == "▶️ Run Check":
             if _k:
                 os.environ["OPENROUTER_API_KEY"] = _k
 
-            # formatted ER: check the cache on the main thread (DB access),
-            # only the AI formatting itself goes to the pool
-            fmt_cached = ""
-            spec_row_f = get_spec(course["spec_url"]) if course["spec_url"] else None
-            if spec_row_f and spec_row_f.get("entry_req_formatted"):
-                fmt_cached = strip_excluded_sections(spec_row_f["entry_req_formatted"])
-
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
                 f_er = pool.submit(ai_compare, course["name"], page_entry,
                                    spec_entry, course["excel_entry"] or "")
-                f_moa = f_corr_moa = f_fmt = None
+                f_moa = f_corr_moa = None
                 if spec_moa.strip() or page_moa.strip():
                     f_moa = pool.submit(ai_compare_moa, course["name"],
                                         page_moa, spec_moa)
                     f_corr_moa = pool.submit(build_corrected_moa,
                                              course["name"], spec_moa, page_moa)
-                if spec_entry.strip() and not fmt_cached:
-                    f_fmt = pool.submit(format_spec_entry, course["name"],
-                                        spec_entry)
                 verdict = f_er.result()
                 moa_verdict = f_moa.result() if f_moa else {}
                 moa_corrected = f_corr_moa.result() if f_corr_moa else ""
-                fmt_new = f_fmt.result() if f_fmt else ""
 
             prog.step(4, "Finalising report")
-            if spec_entry.strip():
-                corrected = fmt_cached or fmt_new
-                if fmt_new and spec_row_f:      # cache for next time (main thread)
-                    save_spec(course["spec_url"], entry_req_formatted=fmt_new)
-            else:
-                corrected = verdict.get("corrected_entry_requirements", "")
+            # Never ask the AI to rewrite the authoritative requirements for
+            # the saved suggestion. A deterministic point-by-point rendering
+            # preserves every word, number, grade and test score from the spec.
+            corrected = build_corrected_entry(
+                spec_entry, verdict.get("corrected_entry_requirements", ""))
             moa_result = ""
             if moa_verdict:
                 moa_result = ("Pass" if str(moa_verdict.get("result", "")).lower()
@@ -1876,8 +2372,8 @@ elif page == "▶️ Run Check":
                        "specification, point by point — compare directly with the "
                        "course page requirements above.")
             corrected_txt = strip_excluded_sections(
-                (report["corrected"] or "").strip()
-                or build_corrected_entry(report["spec_entry"], ""))
+                build_corrected_entry(report["spec_entry"],
+                                      report["corrected"] or ""))
             st.markdown(corrected_txt or "—")
 
         # ── TAB 2: Method of Assessment ──────────────────────────────
@@ -1939,7 +2435,8 @@ elif page == "▶️ Run Check":
 elif page == "📄 Reports":
     header.page_header("📄 Reports Dashboard",
                        "Every check at a glance — search, filter and export "
-                       "validation reports.")
+                       "validation reports.",
+                       chip="Results and exports")
     reports = all_reports()
     if not reports:
         st.info("No reports yet — run a check first.")
@@ -1977,7 +2474,8 @@ elif page == "✍️ Content Quality":
                        "Paste or upload course content — grammar, articles, "
                        "sentence structure, capitalisation, proper nouns, "
                        "spelling, commas and consistency, colour-coded like a "
-                       "proofreader's markup.")
+                       "proofreader's markup.",
+                       chip="Editorial review")
 
     # legend
     legend = "".join(
@@ -2067,7 +2565,8 @@ elif page == "✍️ Content Quality":
 else:
     header.page_header("🗂️ Manage Data",
                        "Everything you upload stays in the local database "
-                       "until you remove it here.")
+                       "until you remove it here.",
+                       chip="Workspace administration")
     st.caption("Everything you upload is kept in the local database "
                f"(`{DB_PATH}`) until you remove it here.")
 

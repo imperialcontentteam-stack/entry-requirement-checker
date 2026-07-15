@@ -1,5 +1,4 @@
-"""Modern sidebar: logo, app name, navigation menu, AI-connection status,
-version number and footer. Returns the selected page label."""
+"""Branded sidebar with navigation, connection state and version details."""
 
 import streamlit as st
 
@@ -12,29 +11,41 @@ def render(version: str, api_key_present: bool) -> str:
         st.markdown(
             """
             <div class="sb-logo">
-              <div class="mark">✓</div>
+              <div class="mark">CC</div>
               <div>
-                <div class="name">Course Content Checker</div>
-                <div class="sub">Entry Requirements · MoA · Quality</div>
+                <div class="name">Course Content<br>Checker</div>
+                <div class="sub">Validation · compliance · quality</div>
               </div>
             </div>
+            <div class="sb-section-label">Workspace</div>
             """,
             unsafe_allow_html=True,
         )
-        page = st.radio("Navigation", PAGES, label_visibility="collapsed")
+        page = st.radio(
+            "Navigation",
+            PAGES,
+            key="main_navigation",
+            label_visibility="collapsed",
+        )
 
-        st.markdown("")
         if api_key_present:
-            st.success("🔑 OpenRouter connected (US hosts)", icon="✅")
+            status_class = "ok"
+            status_text = "AI service connected"
         else:
-            st.error("Add `OPENROUTER_API_KEY` to Streamlit Secrets", icon="🔑")
+            status_class = "err"
+            status_text = "OpenRouter API key required"
+        st.markdown(
+            f'<div class="sb-status {status_class}"><span class="dot"></span>'
+            f'<span>{status_text}</span></div>',
+            unsafe_allow_html=True,
+        )
 
         st.markdown(
             f"""
             <div class="sb-footer">
-              <b>v{version}</b> · Purple edition<br>
-              Compares course pages against qualification
-              specifications and proofreads content.
+              <span class="version-pill">Version {version}</span><br>
+              Compare course pages with qualification specifications, create
+              reports, and proofread content from one workspace.
             </div>
             """,
             unsafe_allow_html=True,
