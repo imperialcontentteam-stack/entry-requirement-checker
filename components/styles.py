@@ -25,8 +25,6 @@ MUTED = "#627D98"
 
 _CSS = f"""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@600;700;800&display=swap');
-
 :root {{
   --cc-primary: {PRIMARY};
   --cc-primary-dark: {PRIMARY_DARK};
@@ -45,7 +43,7 @@ _CSS = f"""
 
 /* ── Base canvas and typography ─────────────────────────────────── */
 html, body, [class*="css"], .stApp {{
-  font-family: 'DM Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   color: {TEXT};
 }}
 .stApp {{
@@ -55,7 +53,7 @@ html, body, [class*="css"], .stApp {{
     {BACKGROUND};
 }}
 h1, h2, h3 {{
-  font-family: 'Manrope', 'DM Sans', sans-serif;
+  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   color: {TEXT};
   letter-spacing: -.025em;
 }}
@@ -88,7 +86,7 @@ div[data-testid="stDecoration"] {{ display: none; }}
   0%, 100% {{ transform: translate3d(0,0,0); }}
   50% {{ transform: translate3d(0,-7px,0); }}
 }}
-.block-container > div {{ animation: ccFadeUp .32s ease-out; }}
+.app-hero {{ animation: ccFadeUp .18s ease-out; }}
 
 /* ── Hero header ────────────────────────────────────────────────── */
 .app-hero {{
@@ -187,7 +185,7 @@ div[data-testid="stDecoration"] {{ display: none; }}
   box-shadow: inset 0 1px 0 rgba(255,255,255,.28), 0 16px 28px rgba(0,0,0,.16);
   backdrop-filter: blur(12px);
   color: #FFFFFF;
-  font-family: 'Manrope', sans-serif;
+  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   font-size: 1.55rem;
   font-weight: 800;
 }}
@@ -247,7 +245,7 @@ hr {{ border-color: {BORDER} !important; margin: 1.7rem 0 !important; }}
 .stat-card .num {{
   position: relative;
   z-index: 1;
-  font-family: 'Manrope', sans-serif;
+  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   font-size: clamp(1.35rem, 2vw, 1.85rem);
   font-weight: 800;
   line-height: 1.08;
@@ -360,7 +358,7 @@ div[data-testid="stSidebar"] span {{ color: {TEXT}; }}
   color: #FFFFFF !important;
   background: linear-gradient(145deg, {PRIMARY_DARK}, {PRIMARY} 60%, {AQUA});
   box-shadow: 0 9px 20px rgba(15,118,110,.23);
-  font-family: 'Manrope', sans-serif;
+  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   font-size: .92rem;
   font-weight: 800;
 }}
@@ -375,7 +373,7 @@ div[data-testid="stSidebar"] span {{ color: {TEXT}; }}
 }}
 .sb-logo .name {{
   color: {TEXT} !important;
-  font-family: 'Manrope', sans-serif;
+  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   font-size: .96rem;
   line-height: 1.18;
   font-weight: 800;

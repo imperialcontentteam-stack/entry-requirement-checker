@@ -271,7 +271,7 @@ RED = "#DC2626"
 GREEN = "#16A34A"
 AMBER = "#D97706"
 
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.1.3"
 EXTRACTION_VERSION = "2.0.3-pdf1"
 
 # ═══════════════════════════════════════════════════════════════════
@@ -296,6 +296,7 @@ def _ds(rows):
     return [dict(r) for r in rows]
 
 
+@st.cache_resource(show_spinner=False)
 def init_db():
     c = get_conn()
     c.executescript("""
@@ -1405,7 +1406,7 @@ Identify:
 3. Incorrect requirements — present on the course page but wrong or absent per the specification (e.g. wrong age, wrong grades, wrong test scores).
 4. Wording differences that change the meaning (e.g. "must" vs "recommended", "and" vs "or").
 5. Grammar and spelling issues on the course page.
-6. Suggested corrected Entry Requirements for the course page. This MUST be the COMPLETE set of entry requirements from the QUALIFICATION SPECIFICATION: list EVERY requirement point by point (one per line, each line starting with "- "), using the specification's wording exactly as written. Do NOT summarise, shorten, merge or omit ANY requirement from the specification.
+6. Suggested corrected Entry Requirements for the course page. This MUST be the COMPLETE set of entry requirements from the QUALIFICATION SPECIFICATION, rewritten as clear, natural, publish-ready website copy. Include every requirement without summarising or omitting facts; preserve exact ages, grades, scores, test names and mandatory/recommended meaning; use fresh sentence structure rather than copying long source phrases.
 
 Decision rules:
 * When the qualification specification is available, it is the ONLY authority for the course-page Pass/Fail result. An Excel mismatch must be reported through matches_excel/summary but must not by itself fail the course page.
@@ -1424,7 +1425,7 @@ Reply with EXACTLY this JSON:
   "wording_differences": ["..."],
   "grammar_spelling": ["..."],
   "summary": "1-3 sentence overall verdict",
-  "corrected_entry_requirements": "- requirement 1\\n- requirement 2\\n- ... (every requirement from the specification, verbatim, none omitted)"
+  "corrected_entry_requirements": "Complete, natural, publish-ready wording containing every qualification-specification requirement"
 }}
 
 COURSE PAGE ENTRY REQUIREMENTS:
@@ -1602,45 +1603,41 @@ def spec_to_points(spec: str) -> str:
 
 
 def build_corrected_entry(spec_entry: str, ai_corrected: str) -> str:
-    """The suggested corrected Entry Requirements shown to the user.
-    Specification available → the full spec list (nothing omitted).
-    No specification → fall back to the AI suggestion."""
+    """Return the publish-ready AI suggestion when available.
+
+    The specification-derived point list is a safe fallback so a temporary AI
+    formatting failure never removes an authoritative requirement.
+    """
+    if (ai_corrected or "").strip():
+        return strip_excluded_sections(ai_corrected.strip())
     if (spec_entry or "").strip():
-        return spec_to_points(spec_entry)
-    return (ai_corrected or "").strip()
+        return strip_excluded_sections(spec_to_points(spec_entry))
+    return ""
 
 
-# ── AI formatting into the categorised, point-by-point layout ────────
+# ── AI-generated, publish-ready Entry Requirements wording ──────────
 
 AI_FORMAT_SYSTEM = (
-    "You format the Entry Requirements of UK qualification specifications. "
-    "Reply ONLY with the formatted text — no JSON, no code fences, no commentary "
-    "before or after."
+    "You are an expert UK education content writer. Produce polished, "
+    "publish-ready course-page copy in natural language. Reply ONLY with the "
+    "finished wording — no JSON, no code fences, no notes or commentary."
 )
 
-AI_FORMAT_PROMPT = """Reformat the ENTRY REQUIREMENTS below into the exact layout of this example (structure and style only — the CONTENT must come solely from the text provided):
+AI_FORMAT_PROMPT = """Write a complete, natural-sounding Entry Requirements section for the course "{name}" using ONLY the authoritative qualification-specification text below.
 
-Based on the provided document, the entry requirements for the {name} are as follows:
+The wording must feel professionally written by a human rather than copied from a source document. Paraphrase the prose substantially and vary the sentence structure, while preserving every factual requirement and the exact meaning.
 
-* Age Requirement: These qualifications are designed for learners who are typically aged 16+.
-* General Access Policy: ATHE's policy ensures that the qualifications should be available to everyone capable of reaching the required standards, free from barriers to access and progression, and with equal opportunities for all.
-* Typical Entry Profile for Recent Learners: For learners who have recently been in education or training, the entry profile is likely to include one of the following:
-    * 5 or more GCSEs at grades 4 and above
-    * Other related level 2 subjects
-* English Language Proficiency: Learners must have an appropriate standard of English to access resources and complete assignments. For those whose first language is not English, the recommended standards are:
-    * IELTS 5.5
-    * Common European Framework of Reference (CEFR) B2
+MANDATORY RULES:
+1. Include EVERY applicable entry requirement, condition, policy statement, learner profile, centre responsibility and alternative route in the source. Do not omit, merge away, shorten or invent requirements.
+2. Preserve all factual values exactly, including ages, qualification levels, grades, ranges, scores, percentages, test names, acronyms and official qualification names.
+3. Preserve logical meaning exactly: mandatory requirements must remain mandatory; recommendations must remain recommendations; and/or choices must not be changed.
+4. Use an inviting introductory sentence followed by clear top-level bullets and nested bullets where useful. Write complete, fluent sentences suitable for direct publication on a college website.
+5. Create fresh wording. Avoid copying long phrases from the source except where exact wording is unavoidable for official names, tests, grades, standards or technical terms.
+6. Do not mention the specification, source document, AI, rewriting, plagiarism or these instructions.
+7. EXCLUDE any section about Reasonable Adjustments or Special Considerations.
+8. Output the FULL finished Entry Requirements copy only.
 
-RULES — follow ALL of them:
-1. Start with exactly: "Based on the provided document, the entry requirements for the {name} are as follows:"
-2. Include EVERY requirement from the source text. Do NOT omit, merge, shorten or summarise anything. Every age limit, qualification, grade, test name, score, policy statement and centre obligation in the source MUST appear in the output.
-3. Keep the specification's wording faithful — you may only add the short category labels (e.g. "Age Requirement:", "English Language Proficiency:") and adjust joining words needed by the layout. Never change numbers, grades, scores or test names.
-4. One "* " bullet per requirement category, starting with a bold-free short label followed by a colon.
-5. Where the source lists alternatives or multiple items (e.g. GCSE options, English tests), put each item on its own nested bullet indented with 4 spaces: "    * item".
-6. Do not invent requirements that are not in the source text.
-7. EXCLUDE anything about "Reasonable Adjustments" and "Special Considerations" — do not output that section or any of its content, even if it appears in the source text.
-
-ENTRY REQUIREMENTS (source text):
+AUTHORITATIVE ENTRY REQUIREMENTS:
 {spec}
 """
 
@@ -1669,21 +1666,51 @@ def strip_excluded_sections(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
 
 
+def _factual_markers(text: str) -> set:
+    """Values that a safe rewrite must preserve verbatim.
+
+    This intentionally focuses on objective markers rather than ordinary prose:
+    numbers, grade/range forms, percentages and common all-cap acronyms.
+    """
+    text = text or ""
+    markers = set(re.findall(
+        r"(?<!\w)\d+(?:\.\d+)?(?:\s*[-–]\s*\d+(?:\.\d+)?)?%?\+?(?!\w)",
+        text))
+    # Match acronyms in both singular and plural forms: GCSE / GCSEs.
+    markers.update(re.findall(
+        r"(?<!\w)[A-Z]{2,}[A-Z0-9./-]*(?=s?\b)", text))
+    markers.update(re.findall(r"(?<!\w)[A-Z]\d(?:[+-])?(?!\w)", text))
+    return {re.sub(r"\s+", "", marker).casefold() for marker in markers}
+
+
+def _ai_wording_is_complete(source: str, wording: str) -> bool:
+    """Conservative completeness check for the publish-ready AI rewrite."""
+    src = strip_excluded_sections(spec_to_points(source))
+    out = strip_excluded_sections(wording)
+    if not src or not out:
+        return False
+    # A very short answer is almost always a summary with requirements omitted.
+    if len(out) < max(80, int(len(src) * 0.62)):
+        return False
+    required_markers = _factual_markers(src)
+    output_markers = _factual_markers(out)
+    return required_markers.issubset(output_markers)
+
+
 def format_spec_entry(qual_name: str, spec_entry: str) -> str:
-    """AI-format the spec's Entry Requirements into the categorised
-    point-by-point layout. Falls back to the deterministic list if the
-    AI reply fails or looks incomplete (guarding against omissions)."""
+    """Create complete, original, human-style publish-ready wording.
+
+    If the model omits factual markers or produces an implausibly short answer,
+    fall back to the full deterministic specification list rather than showing
+    incomplete advice.
+    """
     fallback = strip_excluded_sections(spec_to_points(spec_entry))
     try:
         out = call_ai(AI_FORMAT_PROMPT.format(name=qual_name, spec=spec_entry),
-                      AI_FORMAT_SYSTEM).strip()
+                      AI_FORMAT_SYSTEM, temperature=0.45).strip()
         out = re.sub(r"^```[a-z]*\s*|\s*```$", "", out, flags=re.S).strip()
         out = strip_excluded_sections(out)
-        # completeness guard: a faithful reformat of the full spec cannot be
-        # much shorter than the source — if it is, requirements were dropped
-        # (the excluded section is discounted from the source length first)
-        src = strip_excluded_sections(spec_to_points(spec_entry))
-        if out and len(out) >= 0.6 * len(src):
+        if _ai_wording_is_complete(spec_entry, out):
             return out
     except Exception:
         pass
@@ -1773,6 +1800,7 @@ def process_spec(url: str, force: bool = False, use_ai_fallback: bool = True) ->
 #  PDF REPORT
 # ═══════════════════════════════════════════════════════════════════
 
+@st.cache_data(show_spinner=False, max_entries=128)
 def build_pdf(course, report) -> bytes:
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -1841,11 +1869,9 @@ def build_pdf(course, report) -> bytes:
     issue_block("Wording Differences (meaning-changing)", "wording_differences")
     issue_block("Grammar & Spelling Issues", "grammar_spelling")
 
-    corrected = strip_excluded_sections(
-        build_corrected_entry(report["spec_entry"],
-                              report["corrected"] or ""))
-    story += [Paragraph("Suggested Corrected Entry Requirements "
-                        "(complete set from the qualification specification)", h2),
+    corrected = build_corrected_entry(
+        report["spec_entry"], report["corrected"] or "")
+    story += [Paragraph("AI-Suggested Entry Requirements Wording", h2),
               Paragraph(esc(corrected) or "—", body)]
 
     # ── Method of Assessment check ───────────────────────────────────
@@ -2129,7 +2155,30 @@ if page == "📥 Upload & Specs":
             prog.finish()
             st.rerun()
 
-        for s in all_specs():
+        current_specs = all_specs()
+        sp1, sp2 = st.columns([1, 1])
+        upload_spec_page_size = sp1.selectbox(
+            "Specifications per page", [10, 25, 50],
+            key="upload_spec_page_size")
+        upload_spec_page_count = max(
+            1, (len(current_specs) + upload_spec_page_size - 1)
+            // upload_spec_page_size)
+        if not 1 <= int(st.session_state.get(
+                "upload_spec_page", 1)) <= upload_spec_page_count:
+            st.session_state["upload_spec_page"] = 1
+        upload_spec_page = int(sp2.number_input(
+            "Specification page", min_value=1,
+            max_value=upload_spec_page_count, value=1, step=1,
+            key="upload_spec_page"))
+        upload_spec_start = (upload_spec_page - 1) * upload_spec_page_size
+        visible_upload_specs = current_specs[
+            upload_spec_start:upload_spec_start + upload_spec_page_size]
+        st.caption(
+            f"Showing {upload_spec_start + 1}–"
+            f"{upload_spec_start + len(visible_upload_specs)} of "
+            f"{len(current_specs)} specifications.")
+
+        for s in visible_upload_specs:
             n_courses = get_conn().execute(
                 "SELECT COUNT(*) c FROM courses WHERE spec_url=?",
                 (s["url"],)).fetchone()["c"]
@@ -2278,6 +2327,9 @@ elif page == "▶️ Run Check":
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
                 f_er = pool.submit(ai_compare, course["name"], page_entry,
                                    spec_entry, course["excel_entry"] or "")
+                f_entry_wording = (pool.submit(format_spec_entry,
+                                               course["name"], spec_entry)
+                                   if spec_entry.strip() else None)
                 f_moa = f_corr_moa = None
                 if spec_moa.strip() or page_moa.strip():
                     f_moa = pool.submit(ai_compare_moa, course["name"],
@@ -2285,15 +2337,15 @@ elif page == "▶️ Run Check":
                     f_corr_moa = pool.submit(build_corrected_moa,
                                              course["name"], spec_moa, page_moa)
                 verdict = f_er.result()
+                ai_entry_wording = (f_entry_wording.result()
+                                    if f_entry_wording else "")
                 moa_verdict = f_moa.result() if f_moa else {}
                 moa_corrected = f_corr_moa.result() if f_corr_moa else ""
 
             prog.step(4, "Finalising report")
-            # Never ask the AI to rewrite the authoritative requirements for
-            # the saved suggestion. A deterministic point-by-point rendering
-            # preserves every word, number, grade and test score from the spec.
             corrected = build_corrected_entry(
-                spec_entry, verdict.get("corrected_entry_requirements", ""))
+                spec_entry,
+                ai_entry_wording or verdict.get("corrected_entry_requirements", ""))
             moa_result = ""
             if moa_verdict:
                 moa_result = ("Pass" if str(moa_verdict.get("result", "")).lower()
@@ -2367,13 +2419,12 @@ elif page == "▶️ Run Check":
                 show_issues(issues, "Grammar & Spelling",
                             "grammar_spelling", AMBER, "er")
 
-            st.markdown("**Suggested Corrected Entry Requirements**")
-            st.caption("Complete set of entry requirements from the qualification "
-                       "specification, point by point — compare directly with the "
-                       "course page requirements above.")
-            corrected_txt = strip_excluded_sections(
-                build_corrected_entry(report["spec_entry"],
-                                      report["corrected"] or ""))
+            st.markdown("**✨ AI-Suggested Entry Requirements Wording**")
+            st.caption("Full, publish-ready wording written in a natural style from "
+                       "the authoritative requirements. Review before publishing; "
+                       "automated plagiarism scores cannot be guaranteed.")
+            corrected_txt = build_corrected_entry(
+                report["spec_entry"], report["corrected"] or "")
             st.markdown(corrected_txt or "—")
 
         # ── TAB 2: Method of Assessment ──────────────────────────────
@@ -2438,6 +2489,7 @@ elif page == "📄 Reports":
                        "validation reports.",
                        chip="Results and exports")
     reports = all_reports()
+    visible_reports = []
     if not reports:
         st.info("No reports yet — run a check first.")
     else:
@@ -2445,7 +2497,25 @@ elif page == "📄 Reports":
         reports = report_ui.filter_controls(reports)
         if not reports:
             st.warning("No reports match the current search/filter.")
-    for r in reports:
+        else:
+            # Rendering hundreds of expanders and buttons on every Streamlit
+            # rerun makes sidebar navigation feel slow. Keep filtering over the
+            # full dataset, but render only the selected page of results.
+            pc1, pc2 = st.columns([1, 1])
+            page_size = pc1.selectbox(
+                "Reports per page", [10, 25, 50], key="reports_page_size")
+            page_count = max(1, (len(reports) + page_size - 1) // page_size)
+            if not 1 <= int(st.session_state.get("reports_page_number", 1)) <= page_count:
+                st.session_state["reports_page_number"] = 1
+            report_page = int(pc2.number_input(
+                "Page", min_value=1, max_value=page_count, value=1,
+                step=1, key="reports_page_number"))
+            start = (report_page - 1) * page_size
+            visible_reports = reports[start:start + page_size]
+            st.caption(
+                f"Showing {start + 1}–{start + len(visible_reports)} of "
+                f"{len(reports)} matching reports.")
+    for r in visible_reports:
         icon = "🟢" if r["result"] == "Pass" else "🔴"
         moa_tag = f" · MoA: {r['moa_result']}" if r.get("moa_result") else ""
         with st.expander(f"{icon} {r['result']}{moa_tag} · {r['course_name']} "
@@ -2458,10 +2528,24 @@ elif page == "📄 Reports":
                 st.markdown(f"> Method of Assessment: {moa_issues['summary']}")
             course = get_course(r["course_id"])
             if course:
-                pdf = build_pdf(course, r)
-                st.download_button("⬇️ Download PDF", data=pdf,
-                                   file_name=f"ER_Report_{r['id']}.pdf",
-                                   mime="application/pdf", key=f"dl_{r['id']}")
+                # PDF creation can be comparatively expensive. Streamlit executes
+                # the contents of closed expanders too, so generating every PDF
+                # here made the Reports page slow merely by navigating to it.
+                # Build only the report the user actually asks for, then keep the
+                # bytes in session state for immediate download on later reruns.
+                pdf_state_key = f"prepared_report_pdf_{r['id']}"
+                p1, p2 = st.columns([1, 3])
+                if p1.button("Prepare PDF", key=f"prep_{r['id']}"):
+                    with st.spinner("Preparing PDF…"):
+                        st.session_state[pdf_state_key] = build_pdf(course, r)
+                if pdf_state_key in st.session_state:
+                    p2.download_button(
+                        "⬇️ Download PDF",
+                        data=st.session_state[pdf_state_key],
+                        file_name=f"ER_Report_{r['id']}.pdf",
+                        mime="application/pdf",
+                        key=f"dl_{r['id']}",
+                    )
             if st.button("Delete report", key=f"delrep_{r['id']}"):
                 delete_report(r["id"])
                 st.rerun()
@@ -2571,20 +2655,59 @@ else:
                f"(`{DB_PATH}`) until you remove it here.")
 
     st.subheader("Courses")
-    for c in all_courses():
-        col1, col2 = st.columns([6, 1])
-        col1.markdown(f"**{c['number']} — {c['name']}**  \n{c['course_url']}")
-        if col2.button("🗑️ Remove", key=f"delc_{c['id']}"):
-            delete_course(c["id"])
-            st.rerun()
+    manage_courses = all_courses()
+    if manage_courses:
+        mc1, mc2 = st.columns([1, 1])
+        course_page_size = mc1.selectbox(
+            "Courses per page", [20, 50, 100], key="manage_course_page_size")
+        course_page_count = max(
+            1, (len(manage_courses) + course_page_size - 1) // course_page_size)
+        if not 1 <= int(st.session_state.get("manage_course_page", 1)) <= course_page_count:
+            st.session_state["manage_course_page"] = 1
+        course_page = int(mc2.number_input(
+            "Course page", min_value=1, max_value=course_page_count,
+            value=1, step=1, key="manage_course_page"))
+        course_start = (course_page - 1) * course_page_size
+        visible_courses = manage_courses[course_start:course_start + course_page_size]
+        st.caption(
+            f"Showing {course_start + 1}–{course_start + len(visible_courses)} "
+            f"of {len(manage_courses)} courses.")
+        for c in visible_courses:
+            col1, col2 = st.columns([6, 1])
+            col1.markdown(f"**{c['number']} — {c['name']}**  \n{c['course_url']}")
+            if col2.button("🗑️ Remove", key=f"delc_{c['id']}"):
+                delete_course(c["id"])
+                st.rerun()
+    else:
+        st.caption("No courses stored.")
 
     st.subheader("Cached Specification Extractions")
-    for s in all_specs():
-        col1, col2 = st.columns([6, 1])
-        col1.markdown(f"{'🟢' if s['status'] == 'ok' else '🔴'} {s['url']}")
-        if col2.button("🗑️ Remove", key=f"dels_{s['id']}"):
-            delete_spec(s["id"])
-            st.rerun()
+    manage_specs = all_specs()
+    if manage_specs:
+        ms1, ms2 = st.columns([1, 1])
+        spec_page_size = ms1.selectbox(
+            "Specifications per page", [20, 50, 100],
+            key="manage_spec_page_size")
+        spec_page_count = max(
+            1, (len(manage_specs) + spec_page_size - 1) // spec_page_size)
+        if not 1 <= int(st.session_state.get("manage_spec_page", 1)) <= spec_page_count:
+            st.session_state["manage_spec_page"] = 1
+        spec_page = int(ms2.number_input(
+            "Specification page", min_value=1, max_value=spec_page_count,
+            value=1, step=1, key="manage_spec_page"))
+        spec_start = (spec_page - 1) * spec_page_size
+        visible_specs = manage_specs[spec_start:spec_start + spec_page_size]
+        st.caption(
+            f"Showing {spec_start + 1}–{spec_start + len(visible_specs)} "
+            f"of {len(manage_specs)} specifications.")
+        for s in visible_specs:
+            col1, col2 = st.columns([6, 1])
+            col1.markdown(f"{'🟢' if s['status'] == 'ok' else '🔴'} {s['url']}")
+            if col2.button("🗑️ Remove", key=f"dels_{s['id']}"):
+                delete_spec(s["id"])
+                st.rerun()
+    else:
+        st.caption("No cached specifications stored.")
 
     st.divider()
     st.subheader("Danger zone")
