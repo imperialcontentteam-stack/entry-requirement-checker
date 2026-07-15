@@ -271,8 +271,9 @@ RED = "#DC2626"
 GREEN = "#16A34A"
 AMBER = "#D97706"
 
-APP_VERSION = "2.1.3"
+APP_VERSION = "2.1.4"
 EXTRACTION_VERSION = "2.0.3-pdf1"
+ENTRY_WORDING_VERSION = "2.1.4-relevant1"
 
 # ═══════════════════════════════════════════════════════════════════
 #  DATABASE
@@ -343,6 +344,7 @@ def init_db():
     migrations = (
         # cache for the formatted (point-by-point, categorised) entry reqs
         "ALTER TABLE specs ADD COLUMN entry_req_formatted TEXT",
+        "ALTER TABLE specs ADD COLUMN entry_req_format_version TEXT",
         # Method of Assessment check
         "ALTER TABLE specs ADD COLUMN moa TEXT",
         "ALTER TABLE specs ADD COLUMN extractor_version TEXT",
@@ -351,6 +353,7 @@ def init_db():
         "ALTER TABLE reports ADD COLUMN moa_issues_json TEXT",
         "ALTER TABLE reports ADD COLUMN moa_corrected TEXT",
         "ALTER TABLE reports ADD COLUMN moa_result TEXT",
+        "ALTER TABLE reports ADD COLUMN entry_wording_version TEXT",
     )
     for m in migrations:
         try:
@@ -478,19 +481,20 @@ def delete_spec(spec_id: int):
 def save_report(course_id: int, result: str, page_entry: str, spec_entry: str,
                 excel_entry: str, issues: dict, corrected: str,
                 page_moa: str = "", spec_moa: str = "", moa_issues: dict = None,
-                moa_corrected: str = "", moa_result: str = "") -> int:
+                moa_corrected: str = "", moa_result: str = "",
+                entry_wording_version: str = ENTRY_WORDING_VERSION) -> int:
     c = get_conn()
     cur = c.execute("""
         INSERT INTO reports (course_id, result, page_entry, spec_entry,
                              excel_entry, issues_json, corrected, created_at,
                              page_moa, spec_moa, moa_issues_json,
-                             moa_corrected, moa_result)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                             moa_corrected, moa_result, entry_wording_version)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (course_id, result, page_entry, spec_entry, excel_entry,
           json.dumps(issues, ensure_ascii=False), corrected, now(),
           page_moa, spec_moa,
           json.dumps(moa_issues or {}, ensure_ascii=False),
-          moa_corrected, moa_result))
+          moa_corrected, moa_result, entry_wording_version))
     c.commit()
     return cur.lastrowid
 
@@ -1406,9 +1410,10 @@ Identify:
 3. Incorrect requirements — present on the course page but wrong or absent per the specification (e.g. wrong age, wrong grades, wrong test scores).
 4. Wording differences that change the meaning (e.g. "must" vs "recommended", "and" vs "or").
 5. Grammar and spelling issues on the course page.
-6. Suggested corrected Entry Requirements for the course page. This MUST be the COMPLETE set of entry requirements from the QUALIFICATION SPECIFICATION, rewritten as clear, natural, publish-ready website copy. Include every requirement without summarising or omitting facts; preserve exact ages, grades, scores, test names and mandatory/recommended meaning; use fresh sentence structure rather than copying long source phrases.
-
 Decision rules:
+* The extracted specification section may contain neighbouring or administrative text. Treat ONLY explicit applicant-facing admission or eligibility conditions as Entry Requirements.
+* Include criteria such as minimum age, prerequisite qualifications or grades, English/literacy/numeracy standards, required experience, interviews, portfolios, auditions, references, checks, and explicitly accepted alternative entry routes.
+* Ignore course content, units, assessment, grading, duration, progression, careers, marketing text, general learner-profile descriptions, centre/provider responsibilities, quality-assurance processes, registration administration, resources, reasonable adjustments, and special considerations unless a sentence explicitly states an applicant admission condition.
 * When the qualification specification is available, it is the ONLY authority for the course-page Pass/Fail result. An Excel mismatch must be reported through matches_excel/summary but must not by itself fail the course page.
 * When the qualification specification is unavailable, use the Excel tracker as the fallback authority. State this clearly in the summary.
 * Compare only explicit requirements. Do not invent, infer, or generalise requirements that are not written in the authority source.
@@ -1424,8 +1429,7 @@ Reply with EXACTLY this JSON:
   "incorrect_requirements": ["..."],
   "wording_differences": ["..."],
   "grammar_spelling": ["..."],
-  "summary": "1-3 sentence overall verdict",
-  "corrected_entry_requirements": "Complete, natural, publish-ready wording containing every qualification-specification requirement"
+  "summary": "1-3 sentence overall verdict"
 }}
 
 COURSE PAGE ENTRY REQUIREMENTS:
@@ -1554,34 +1558,58 @@ def build_corrected_moa(qual_name: str, spec_moa: str, page_moa: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  SUGGESTED CORRECTED ENTRY REQUIREMENTS
+#  AI-SUGGESTED ENTRY REQUIREMENTS — RELEVANT APPLICANT CRITERIA ONLY
 # ═══════════════════════════════════════════════════════════════════
-# The suggested output must be the COMPLETE set of entry requirements
-# from the qualification specification, listed point by point with the
-# specification's wording preserved verbatim. It is therefore built
-# deterministically from the cached spec extraction rather than from
-# the AI's (potentially summarised) suggestion — the AI text is only
-# used as a fallback when no specification is available.
+# Specification sections often contain surrounding policy, centre guidance,
+# progression, assessment, or learner-profile prose. The website suggestion
+# must not copy that whole section. The model first identifies the atomic,
+# applicant-facing admission criteria and then writes concise course-page copy.
+# If generation fails, the fallback is a conservative relevant-item filter —
+# never the complete extracted specification section.
 
 _BULLET_MARK = re.compile(
     r"^\s*(?:[-–—•▪●○◦*]|\d{1,2}[.)]|[a-zA-Z][.)]|o(?=\s))\s*")
 
+_HARD_ENTRY_SIGNALS = re.compile(
+    r"\b(?:minimum\s+age|aged?\s+\d|years?\s+old|entry\s+requirements?|"
+    r"admission|applicants?\s+(?:must|need|require)|learners?\s+must|"
+    r"must\s+(?:have|hold|be|achieve|demonstrate|provide|complete)|"
+    r"required\s+to|prerequisite|prior\s+qualification|equivalent\s+qualification|"
+    r"qualification|level\s*\d|grades?|GCSEs?|A[ -]?levels?|UCAS|credits?|"
+    r"IELTS|CEFR|TOEFL|PTE|English\s+language|literacy|numeracy|maths?|"
+    r"work\s+experience|professional\s+experience|portfolio|interview|audition|"
+    r"references?|DBS|criminal\s+record|right\s+to\s+study|visa|medical|"
+    r"health\s+check|alternative\s+entry|recognition\s+of\s+prior\s+learning)\b",
+    re.I,
+)
 
-def spec_to_points(spec: str) -> str:
-    """Format the specification's Entry Requirements as a point-by-point
-    list ('- ' per line), keeping every requirement and its exact wording.
-    Only layout is normalised: PDF line-wrapping is re-joined and bullet
-    glyphs are unified — no words are added, changed or removed."""
+_UNRELATED_ENTRY_SIGNALS = re.compile(
+    r"\b(?:course\s+content|curriculum|units?|learning\s+outcomes?|assessment|"
+    r"grading|guided\s+learning|qualification\s+time|duration|progression|"
+    r"career|employment\s+opportunities|centre(?:s)?\s+(?:must|should|are)|"
+    r"provider(?:s)?\s+(?:must|should|are)|quality\s+assurance|internal\s+verification|"
+    r"external\s+verification|registration|certification|resources?|delivery|"
+    r"teaching|support\s+for\s+learners|reasonable\s+adjustments?|"
+    r"special\s+considerations?|malpractice|appeals?|complaints?|funding|fees?)\b",
+    re.I,
+)
+
+_NON_REQUIREMENT_PROFILE_SIGNALS = re.compile(
+    r"\b(?:designed\s+for|intended\s+for|suitable\s+for|target\s+learners?|"
+    r"recommended|desirable|ideally|would\s+benefit|should\s+ideally|"
+    r"may\s+find\s+it\s+helpful)\b",
+    re.I,
+)
+
+
+def _logical_spec_items(spec: str) -> list[str]:
+    """Turn PDF/DOCX line wrapping into logical requirement-sized items."""
     text = (spec or "").strip()
     if not text:
-        return ""
-
-    # 1) merge PDF/DOCX line-wrapping back into logical lines: a line
-    #    continues the previous one unless it starts with a bullet/number
-    #    marker or the previous line already ended a sentence/clause.
-    logical = []
-    for raw in text.split("\n"):
-        line = raw.strip()
+        return []
+    logical: list[str] = []
+    for raw in text.splitlines():
+        line = re.sub(r"\s+", " ", raw).strip()
         if not line:
             continue
         starts_new = bool(_BULLET_MARK.match(line))
@@ -1589,144 +1617,213 @@ def spec_to_points(spec: str) -> str:
             logical[-1] += " " + line
         else:
             logical.append(line)
+    items = [_BULLET_MARK.sub("", item).strip() for item in logical]
+    if len(items) == 1 and len(items[0]) > 220:
+        items = [part.strip() for part in
+                 re.split(r"(?<=[.;])\s+(?=[A-Z(])", items[0]) if part.strip()]
+    return [item for item in items if item]
 
-    # 2) strip the bullet glyph/number — the wording itself is untouched
-    points = [p for p in (_BULLET_MARK.sub("", ln).strip() for ln in logical) if p]
 
-    # 3) a single unbroken prose block still needs to read point by point:
-    #    split on sentence boundaries (wording remains verbatim)
-    if len(points) == 1 and len(points[0]) > 200:
-        points = [s.strip() for s in
-                  re.split(r"(?<=[.;])\s+(?=[A-Z(])", points[0]) if s.strip()]
+def _looks_like_relevant_requirement(item: str) -> bool:
+    """Conservative fallback classification used only when the AI fails."""
+    item = re.sub(r"\s+", " ", item or "").strip()
+    if not item or not _HARD_ENTRY_SIGNALS.search(item):
+        return False
+    explicit_condition = bool(re.search(
+        r"\b(?:must|required|minimum|need(?:s|ed)?\s+to|shall|"
+        r"eligible|admitted|accepted|entry\s+condition)\b", item, re.I))
+    if _NON_REQUIREMENT_PROFILE_SIGNALS.search(item) and not explicit_condition:
+        return False
+    if (re.search(r"recognition\s+of\s+prior\s+learning", item, re.I)
+            and not re.search(r"\b(?:entry|admission|accepted|considered|route)\b",
+                              item, re.I)):
+        return False
+    unrelated = bool(_UNRELATED_ENTRY_SIGNALS.search(item))
+    objective_value = bool(re.search(
+        r"\b(?:\d+(?:\.\d+)?%?\+?|level\s*\d|grade\s*[A-Z0-9]|"
+        r"IELTS|CEFR|TOEFL|PTE|GCSE|UCAS|DBS)\b", item, re.I))
+    # Keep a mixed sentence only when it contains an objective applicant value;
+    # otherwise surrounding administrative/policy prose is excluded.
+    return not unrelated or objective_value
 
-    return "\n".join(f"- {p}" for p in points)
+
+def relevant_requirement_items(spec: str) -> list[str]:
+    """Relevant-only deterministic fallback; never returns the whole section."""
+    seen, relevant = set(), []
+    for item in _logical_spec_items(spec):
+        if _looks_like_relevant_requirement(item):
+            clean = re.sub(r"\s+", " ", item).strip(" -•\t")
+            key = clean.casefold()
+            if clean and key not in seen:
+                seen.add(key)
+                relevant.append(clean)
+    return relevant
+
+
+def spec_to_points(spec: str) -> str:
+    """Format only conservatively relevant applicant criteria as bullets."""
+    return "\n".join(f"- {item}" for item in relevant_requirement_items(spec))
+
+
+def strip_excluded_sections(text: str) -> str:
+    """Remove clearly unrelated lines from generated/fallback wording."""
+    kept = []
+    for line in (text or "").splitlines():
+        clean = line.strip()
+        if not clean:
+            if kept and kept[-1] != "":
+                kept.append("")
+            continue
+        # Do not remove a genuine numeric/test requirement merely because the
+        # same sentence mentions an administrative concept.
+        if (_UNRELATED_ENTRY_SIGNALS.search(clean)
+                and not _looks_like_relevant_requirement(clean)):
+            continue
+        kept.append(line.rstrip())
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
 
 
 def build_corrected_entry(spec_entry: str, ai_corrected: str) -> str:
-    """Return the publish-ready AI suggestion when available.
+    """Prefer relevant AI wording; fallback only to filtered applicant criteria."""
+    cleaned = strip_excluded_sections((ai_corrected or "").strip())
+    if cleaned:
+        return cleaned
+    return spec_to_points(spec_entry)
 
-    The specification-derived point list is a safe fallback so a temporary AI
-    formatting failure never removes an authoritative requirement.
-    """
-    if (ai_corrected or "").strip():
-        return strip_excluded_sections(ai_corrected.strip())
-    if (spec_entry or "").strip():
-        return strip_excluded_sections(spec_to_points(spec_entry))
-    return ""
-
-
-# ── AI-generated, publish-ready Entry Requirements wording ──────────
 
 AI_FORMAT_SYSTEM = (
-    "You are an expert UK education content writer. Produce polished, "
-    "publish-ready course-page copy in natural language. Reply ONLY with the "
-    "finished wording — no JSON, no code fences, no notes or commentary."
+    "You are a meticulous UK education admissions editor. Analyse noisy "
+    "qualification-document text and return only explicit applicant-facing "
+    "entry criteria. Reply ONLY with valid JSON — no markdown fences or commentary."
 )
 
-AI_FORMAT_PROMPT = """Write a complete, natural-sounding Entry Requirements section for the course "{name}" using ONLY the authoritative qualification-specification text below.
+AI_FORMAT_PROMPT = """Course: "{name}"
 
-The wording must feel professionally written by a human rather than copied from a source document. Paraphrase the prose substantially and vary the sentence structure, while preserving every factual requirement and the exact meaning.
+The extracted text below may include genuine Entry Requirements mixed with
+neighbouring policy, administration, assessment, progression, centre guidance,
+or general learner-profile information.
 
-MANDATORY RULES:
-1. Include EVERY applicable entry requirement, condition, policy statement, learner profile, centre responsibility and alternative route in the source. Do not omit, merge away, shorten or invent requirements.
-2. Preserve all factual values exactly, including ages, qualification levels, grades, ranges, scores, percentages, test names, acronyms and official qualification names.
-3. Preserve logical meaning exactly: mandatory requirements must remain mandatory; recommendations must remain recommendations; and/or choices must not be changed.
-4. Use an inviting introductory sentence followed by clear top-level bullets and nested bullets where useful. Write complete, fluent sentences suitable for direct publication on a college website.
-5. Create fresh wording. Avoid copying long phrases from the source except where exact wording is unavoidable for official names, tests, grades, standards or technical terms.
-6. Do not mention the specification, source document, AI, rewriting, plagiarism or these instructions.
-7. EXCLUDE any section about Reasonable Adjustments or Special Considerations.
-8. Output the FULL finished Entry Requirements copy only.
+Your task has two stages:
+1. Identify ONLY the explicit conditions an applicant must satisfy, or an
+   explicitly accepted alternative route into the course.
+2. Rewrite those conditions as concise, natural, publish-ready website wording.
 
-AUTHORITATIVE ENTRY REQUIREMENTS:
+INCLUDE ONLY WHEN EXPLICITLY STATED AS AN ADMISSION/ELIGIBILITY CONDITION:
+- minimum age;
+- prerequisite qualifications, levels, grades, credits, or equivalents;
+- English-language, literacy, numeracy, or maths standards and exact scores;
+- required experience;
+- required interview, portfolio, audition, references, DBS/background check,
+  visa/right-to-study, or medical/fitness check;
+- an alternative entry route that the document explicitly accepts.
+
+EXCLUDE:
+- course content, units, learning outcomes, assessment, grading, duration,
+  progression, careers, and marketing/background information;
+- broad descriptions of the target learner or who the qualification is for,
+  unless they state a testable admission condition;
+- centre/provider responsibilities, registration, delivery, resources,
+  quality assurance, verification, certification, or staff guidance;
+- reasonable adjustments, special considerations, malpractice, appeals,
+  funding, and general policy text;
+- recommendations or desirable qualities that are not actual entry conditions.
+
+WRITING RULES:
+- Be concise. Do not copy the whole extracted section or add a generic summary.
+- Preserve exact ages, levels, grades, scores, test names, acronyms, and AND/OR logic.
+- Do not turn a recommendation into a mandatory rule, or vice versa.
+- Do not invent requirements or use information from outside the supplied text.
+- Use a short opening sentence only when useful, followed by clear bullets.
+- Output only applicant-facing wording suitable for direct publication.
+
+Reply with EXACTLY this JSON:
+{{
+  "requirements": ["one atomic, relevant entry condition per item"],
+  "wording": "concise publish-ready Entry Requirements wording"
+}}
+
+EXTRACTED SPECIFICATION TEXT:
 {spec}
 """
 
 
-# Sections that must never appear in the suggested output
-_EXCLUDED_SECTIONS = re.compile(
-    r"reasonable\s+adjustments?|special\s+considerations?", re.I)
-
-
-def strip_excluded_sections(text: str) -> str:
-    """Remove excluded sections (e.g. 'Reasonable Adjustments and Special
-    Considerations') from the formatted output, including their nested
-    sub-bullets. A top-level bullet whose label matches is dropped together
-    with every indented line that follows it."""
-    out, skipping = [], False
-    for ln in (text or "").split("\n"):
-        stripped = ln.lstrip()
-        indent = len(ln) - len(stripped)
-        is_bullet = stripped.startswith(("* ", "- ", "• "))
-        top_level = (is_bullet and indent == 0) or (not is_bullet and stripped)
-        if top_level:
-            skipping = bool(_EXCLUDED_SECTIONS.search(stripped[:80]))
-        if not skipping:
-            out.append(ln)
-    # tidy runs of blank lines left behind
-    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
-
-
-def _factual_markers(text: str) -> set:
-    """Values that a safe rewrite must preserve verbatim.
-
-    This intentionally focuses on objective markers rather than ordinary prose:
-    numbers, grade/range forms, percentages and common all-cap acronyms.
-    """
+def _factual_markers(text: str) -> set[str]:
+    """Objective values the concise rewrite must preserve."""
     text = text or ""
     markers = set(re.findall(
         r"(?<!\w)\d+(?:\.\d+)?(?:\s*[-–]\s*\d+(?:\.\d+)?)?%?\+?(?!\w)",
         text))
-    # Match acronyms in both singular and plural forms: GCSE / GCSEs.
     markers.update(re.findall(
         r"(?<!\w)[A-Z]{2,}[A-Z0-9./-]*(?=s?\b)", text))
     markers.update(re.findall(r"(?<!\w)[A-Z]\d(?:[+-])?(?!\w)", text))
     return {re.sub(r"\s+", "", marker).casefold() for marker in markers}
 
 
-def _ai_wording_is_complete(source: str, wording: str) -> bool:
-    """Conservative completeness check for the publish-ready AI rewrite."""
-    src = strip_excluded_sections(spec_to_points(source))
-    out = strip_excluded_sections(wording)
-    if not src or not out:
+def _ai_wording_is_complete(requirements: list[str], wording: str) -> bool:
+    """Validate against the AI-selected relevant criteria, not the raw section."""
+    req_text = "\n".join(requirements)
+    output = strip_excluded_sections(wording)
+    if not requirements or len(output) < 35:
         return False
-    # A very short answer is almost always a summary with requirements omitted.
-    if len(out) < max(80, int(len(src) * 0.62)):
-        return False
-    required_markers = _factual_markers(src)
-    output_markers = _factual_markers(out)
-    return required_markers.issubset(output_markers)
+    return _factual_markers(req_text).issubset(_factual_markers(output))
+
+
+def _normalise_ai_requirements(values) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    result, seen = [], set()
+    for value in values:
+        item = re.sub(r"\s+", " ", str(value or "")).strip(" -•\t")
+        if not item:
+            continue
+        # The model has already semantically selected the criteria. Apply a
+        # final guard only against unmistakably unrelated output.
+        if (_UNRELATED_ENTRY_SIGNALS.search(item)
+                and not _looks_like_relevant_requirement(item)):
+            continue
+        key = item.casefold()
+        if key not in seen:
+            seen.add(key)
+            result.append(item)
+    return result
 
 
 def format_spec_entry(qual_name: str, spec_entry: str) -> str:
-    """Create complete, original, human-style publish-ready wording.
+    """Generate concise, relevant applicant-facing Entry Requirements only.
 
-    If the model omits factual markers or produces an implausibly short answer,
-    fall back to the full deterministic specification list rather than showing
-    incomplete advice.
+    The raw extracted section is never used as the displayed fallback. If the
+    model's prose is incomplete, its filtered atomic requirement list is shown;
+    if the model call fails, a conservative deterministic filter is used.
     """
-    fallback = strip_excluded_sections(spec_to_points(spec_entry))
+    fallback = spec_to_points(spec_entry)
+    if not (spec_entry or "").strip():
+        return ""
     try:
-        out = call_ai(AI_FORMAT_PROMPT.format(name=qual_name, spec=spec_entry),
-                      AI_FORMAT_SYSTEM, temperature=0.45).strip()
-        out = re.sub(r"^```[a-z]*\s*|\s*```$", "", out, flags=re.S).strip()
-        out = strip_excluded_sections(out)
-        if _ai_wording_is_complete(spec_entry, out):
-            return out
+        raw = call_ai(AI_FORMAT_PROMPT.format(
+            name=qual_name, spec=spec_entry.strip()),
+            AI_FORMAT_SYSTEM, temperature=0.2)
+        payload = parse_json_reply(raw)
+        requirements = _normalise_ai_requirements(payload.get("requirements"))
+        wording = strip_excluded_sections(str(payload.get("wording") or "").strip())
+        if _ai_wording_is_complete(requirements, wording):
+            return wording
+        if requirements:
+            return "\n".join(f"- {item}" for item in requirements)
     except Exception:
         pass
     return fallback
 
 
 def get_or_build_formatted(spec_url: str, qual_name: str, spec_entry: str) -> str:
-    """Formatted spec requirements, cached per specification document.
-    Cached values are passed through the exclusion filter so entries
-    formatted before an exclusion rule was added are cleaned up too."""
+    """Cache relevant-only wording and invalidate older full-section outputs."""
     row = get_spec(spec_url) if spec_url else None
-    if row and row.get("entry_req_formatted"):
+    if (row and row.get("entry_req_formatted")
+            and row.get("entry_req_format_version") == ENTRY_WORDING_VERSION):
         return strip_excluded_sections(row["entry_req_formatted"])
     formatted = format_spec_entry(qual_name, spec_entry)
-    if row and formatted:
-        save_spec(spec_url, entry_req_formatted=formatted)
+    if row:
+        save_spec(spec_url, entry_req_formatted=formatted,
+                  entry_req_format_version=ENTRY_WORDING_VERSION)
     return formatted
 
 
@@ -1789,7 +1886,7 @@ def process_spec(url: str, force: bool = False, use_ai_fallback: bool = True) ->
         save_spec(url, doc_hash=doc_hash, entry_req=entry, moa=moa or "",
                   status="ok", error="", extracted_at=now(),
                   extractor_version=EXTRACTION_VERSION,
-                  entry_req_formatted="")
+                  entry_req_formatted="", entry_req_format_version="")
         return {"skipped": False, "status": "ok"}
     except Exception as e:
         save_spec(url, status="error", error=str(e)[:500], extracted_at=now())
@@ -1869,8 +1966,10 @@ def build_pdf(course, report) -> bytes:
     issue_block("Wording Differences (meaning-changing)", "wording_differences")
     issue_block("Grammar & Spelling Issues", "grammar_spelling")
 
-    corrected = build_corrected_entry(
-        report["spec_entry"], report["corrected"] or "")
+    saved_entry_wording = (report.get("corrected") or ""
+                           if report.get("entry_wording_version") == ENTRY_WORDING_VERSION
+                           else "")
+    corrected = build_corrected_entry(report["spec_entry"], saved_entry_wording)
     story += [Paragraph("AI-Suggested Entry Requirements Wording", h2),
               Paragraph(esc(corrected) or "—", body)]
 
@@ -2196,7 +2295,8 @@ if page == "📥 Upload & Specs":
                 if b1.button("Save edits", key=f"save_{s['id']}"):
                     save_spec(s["url"], entry_req=edited, moa=edited_moa,
                               status="ok", error="",
-                              extracted_at=now(), entry_req_formatted="")
+                              extracted_at=now(), entry_req_formatted="",
+                              entry_req_format_version="")
                     st.success("Saved.")
                 if b2.button("Force re-extract", key=f"re_{s['id']}"):
                     with st.spinner("Re-extracting…"):
@@ -2298,6 +2398,8 @@ elif page == "▶️ Run Check":
                 except Exception:
                     page_moa = page_moa or ""
             spec_entry = spec_moa = ""
+            spec_row = None
+            cached_entry_wording = ""
             prog.step(2, "Loading specification (cached when possible)")
             if course["spec_url"]:
                 with st.spinner("Loading specification…"):
@@ -2315,6 +2417,10 @@ elif page == "▶️ Run Check":
                     else:
                         st.warning("Specification could not be extracted: "
                                    f"{spec_row['error'] if spec_row else 'unknown error'}")
+            if (spec_row and spec_row.get("entry_req_formatted")
+                    and spec_row.get("entry_req_format_version") == ENTRY_WORDING_VERSION):
+                cached_entry_wording = strip_excluded_sections(
+                    spec_row["entry_req_formatted"])
             # ── steps 3+4: all AI checks run IN PARALLEL ──────────────
             prog.step(3, "Running AI checks (Entry Requirements + Method of "
                          "Assessment in parallel)")
@@ -2329,7 +2435,8 @@ elif page == "▶️ Run Check":
                                    spec_entry, course["excel_entry"] or "")
                 f_entry_wording = (pool.submit(format_spec_entry,
                                                course["name"], spec_entry)
-                                   if spec_entry.strip() else None)
+                                   if spec_entry.strip() and not cached_entry_wording
+                                   else None)
                 f_moa = f_corr_moa = None
                 if spec_moa.strip() or page_moa.strip():
                     f_moa = pool.submit(ai_compare_moa, course["name"],
@@ -2338,14 +2445,17 @@ elif page == "▶️ Run Check":
                                              course["name"], spec_moa, page_moa)
                 verdict = f_er.result()
                 ai_entry_wording = (f_entry_wording.result()
-                                    if f_entry_wording else "")
+                                    if f_entry_wording else cached_entry_wording)
                 moa_verdict = f_moa.result() if f_moa else {}
                 moa_corrected = f_corr_moa.result() if f_corr_moa else ""
 
+            if (f_entry_wording and spec_row and ai_entry_wording):
+                save_spec(course["spec_url"],
+                          entry_req_formatted=ai_entry_wording,
+                          entry_req_format_version=ENTRY_WORDING_VERSION)
+
             prog.step(4, "Finalising report")
-            corrected = build_corrected_entry(
-                spec_entry,
-                ai_entry_wording or verdict.get("corrected_entry_requirements", ""))
+            corrected = build_corrected_entry(spec_entry, ai_entry_wording)
             moa_result = ""
             if moa_verdict:
                 moa_result = ("Pass" if str(moa_verdict.get("result", "")).lower()
@@ -2420,11 +2530,14 @@ elif page == "▶️ Run Check":
                             "grammar_spelling", AMBER, "er")
 
             st.markdown("**✨ AI-Suggested Entry Requirements Wording**")
-            st.caption("Full, publish-ready wording written in a natural style from "
-                       "the authoritative requirements. Review before publishing; "
-                       "automated plagiarism scores cannot be guaranteed.")
+            st.caption("Concise, applicant-facing wording generated only from the "
+                       "relevant admission criteria in the qualification specification. "
+                       "Review before publishing.")
+            saved_entry_wording = (report.get("corrected") or ""
+                                   if report.get("entry_wording_version") == ENTRY_WORDING_VERSION
+                                   else "")
             corrected_txt = build_corrected_entry(
-                report["spec_entry"], report["corrected"] or "")
+                report["spec_entry"], saved_entry_wording)
             st.markdown(corrected_txt or "—")
 
         # ── TAB 2: Method of Assessment ──────────────────────────────
