@@ -15,6 +15,10 @@ Workflow
 3. Pick a course → Run Check: the course page's Entry Requirements are
    extracted live, compared (AI) against the cached spec + the Excel value.
 4. A Pass/Fail report is shown and downloadable as PDF.
+5. The original Content Quality Review remains available for proofreading.
+6. A separate Course Overview Quality page can load a selected tracker course's
+   webpage overview, accept pasted text, or extract TXT/DOCX/PDF content for
+   a weighted AI quality evaluation and improved copy.
 
 Persistence
 -----------
@@ -271,7 +275,7 @@ RED = "#DC2626"
 GREEN = "#16A34A"
 AMBER = "#D97706"
 
-APP_VERSION = "2.1.4"
+APP_VERSION = "2.2.1"
 EXTRACTION_VERSION = "2.0.3-pdf1"
 ENTRY_WORDING_VERSION = "2.1.4-relevant1"
 
@@ -925,6 +929,10 @@ ENTRY_HEADING = r"entry\s+requirements?|entry\s+criteria|admission\s+requirement
 MOA_HEADING = (r"method(?:s)?\s+of\s+assessment"
                r"|assessment\s+(?:methods?|approach|overview|strategy|and\s+grading)"
                r"|how\s+(?:is\s+(?:this|the)\s+course|will\s+I\s+be)\s+assessed")
+OVERVIEW_HEADING = (
+    r"course\s+overview|overview|course\s+description|about\s+(?:this|the)\s+course"
+    r"|what\s+is\s+this\s+course\s+about|introduction"
+)
 
 # Words/phrases that begin the NEXT section of a spec document.
 # NOTE: bare generic words (resources, support, contact, assessment, units…)
@@ -1011,6 +1019,11 @@ _PAGE_NEXT = (r"course (?:content|curriculum)|qualification|awarding body"
               r"|speak to an advisor|study method|course duration")
 PAGE_NEXT_AFTER_ENTRY = rf"method(?:s)? of assessment|assessment|{_PAGE_NEXT}"
 PAGE_NEXT_AFTER_MOA = rf"entry requirements?|entry criteria|{_PAGE_NEXT}"
+PAGE_NEXT_AFTER_OVERVIEW = (
+    rf"{ENTRY_HEADING}|{MOA_HEADING}|course\s+(?:content|curriculum|modules?)"
+    rf"|who\s+is\s+this\s+(?:course\s+)?for|career(?:s|\s+path)?|progression"
+    rf"|qualification|awarding\s+body|study\s+method|course\s+duration|faq"
+)
 
 # trailing marketing boilerplate to trim from any extracted page section
 _PAGE_BOILERPLATE = (r"not sure if this course|speak to an advisor"
@@ -1235,6 +1248,61 @@ def extract_page_entry(url: str) -> tuple:
     """Backward-compatible wrapper: (entry_requirements_text, full_page_text)."""
     entry, _, full_text = extract_page_sections(url)
     return entry, full_text
+
+
+def extract_page_overview(url: str) -> tuple:
+    """Return (overview_text, full_page_text) from a public course webpage.
+
+    The extractor first looks for common overview/description headings. If the
+    page has no explicit overview heading, it uses the introductory text under
+    the main H1 and the page meta description as fallbacks.
+    """
+    try:
+        resp = requests.get(url, headers=USER_AGENT, timeout=60,
+                            allow_redirects=True)
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"Could not open the selected course page: {url}. Details: {exc}"
+        ) from exc
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    meta_description = ""
+    meta = soup.find("meta", attrs={"name": re.compile(r"^description$", re.I)})
+    if meta and meta.get("content"):
+        meta_description = _normalise_heading_text(meta.get("content"))
+
+    for tag in soup(["script", "style", "nav", "footer", "header", "noscript", "form"]):
+        tag.decompose()
+
+    overview = _page_section(soup, OVERVIEW_HEADING, PAGE_NEXT_AFTER_OVERVIEW)
+    main = soup.find("main") or soup.find("article") or soup.body or soup
+    full_text = re.sub(r"\n{3,}", "\n\n", main.get_text("\n", strip=True))[:40000]
+
+    if not overview:
+        h1 = main.find("h1") if hasattr(main, "find") else None
+        parts = []
+        if h1:
+            node = h1
+            for _ in range(18):
+                node = node.find_next_sibling()
+                if node is None:
+                    break
+                if getattr(node, "name", None) in {"h2", "h3", "h4"}:
+                    break
+                value = node.get_text("\n", strip=True)
+                if value:
+                    parts.append(value)
+                if sum(len(x) for x in parts) >= 3500:
+                    break
+        intro = "\n".join(parts).strip()
+        if len(intro) >= 80:
+            overview = intro
+        elif len(meta_description) >= 40:
+            overview = meta_description
+
+    overview = _trim_boilerplate(overview)
+    return overview[:6000], full_text
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2075,11 +2143,11 @@ def import_excel(file) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  CONTENT QUALITY REVIEW (ported from the SLC Course Content Checker)
+#  CONTENT QUALITY REVIEW (original proofreading feature)
 # ═══════════════════════════════════════════════════════════════════
 
-# Colour system for the Quality Review markup
-QR_CATEGORIES = {
+# Keep this feature independent from the broader Course Overview Quality page.
+PROOFREAD_CATEGORIES = {
     "grammar":            {"label": "Grammar",             "bg": "#FDD8D6", "border": "#E5484D"},
     "article":            {"label": "Articles (a/an/the)", "bg": "#FFE3C7", "border": "#F76B15"},
     "spelling":           {"label": "Spelling",            "bg": "#E9DDFB", "border": "#8E4EC6"},
@@ -2090,14 +2158,14 @@ QR_CATEGORIES = {
     "consistency":        {"label": "Consistency",         "bg": "#D9F0F4", "border": "#0894B3"},
 }
 
-QR_SYSTEM = (
+PROOFREAD_SYSTEM = (
     "You are a professional UK-English proofreader and copy editor for a college website. "
     "You review course content for grammar, articles (a/an/the), sentence structure, "
     "capitalisation, proper nouns, spelling, commas and punctuation consistency. "
     "You reply ONLY with valid JSON."
 )
 
-QR_PROMPT = """Proofread the text below. Find every issue and classify it into EXACTLY one of these categories:
+PROOFREAD_PROMPT = """Proofread the text below. Find every issue and classify it into EXACTLY one of these categories:
 grammar, article, spelling, punctuation, capitalisation, proper_noun, sentence_structure, consistency
 
 Rules:
@@ -2119,22 +2187,386 @@ Reply with EXACTLY this JSON:
 """
 
 
-def run_quality_review(text: str) -> dict:
-    return parse_json_reply(call_ai(QR_PROMPT.format(text=text), QR_SYSTEM))
+def run_proofreading_review(text: str) -> dict:
+    return parse_json_reply(call_ai(PROOFREAD_PROMPT.format(text=text), PROOFREAD_SYSTEM))
 
 
-def annotate_text_html(text: str, issues: list) -> str:
-    """Return HTML with each issue wrapped in a coloured <mark>, numbered like
-    a proofreader's markup."""
+def annotate_proofreading_html(text: str, issues: list) -> str:
+    """Return proofreading markup using the original eight categories."""
     escaped = html.escape(text)
     for n, issue in enumerate(issues, start=1):
         original = html.escape(str(issue.get("original", "")))
         if not original:
             continue
-        cat = issue.get("category", "grammar")
-        style = QR_CATEGORIES.get(cat, QR_CATEGORIES["grammar"])
-        tip = html.escape(f"{style['label']}: {issue.get('correction','')} — "
-                          f"{issue.get('explanation','')}")
+        category = issue.get("category", "grammar")
+        style = PROOFREAD_CATEGORIES.get(category, PROOFREAD_CATEGORIES["grammar"])
+        tip = html.escape(
+            f"{style['label']}: {issue.get('correction', '')} — "
+            f"{issue.get('explanation', '')}"
+        )
+        mark = (
+            f'<mark class="qr-mark" style="background:{style["bg"]};'
+            f'border-bottom:2px solid {style["border"]};" title="{tip}">'
+            f'<sup class="qr-num" style="background:{style["border"]};">{n}</sup>{original}</mark>'
+        )
+        escaped = escaped.replace(original, mark, 1)
+    return escaped.replace("\n", "<br>")
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  COURSE OVERVIEW QUALITY REVIEW
+# ═══════════════════════════════════════════════════════════════════
+
+# The AI scores every criterion from 0-100. Python applies the fixed weights
+# below so the overall result is consistent across model responses.
+QUALITY_CRITERIA = {
+    "accuracy_credibility": {
+        "label": "Accuracy & credibility", "weight": 14,
+        "bg": "#FDD8D6", "border": "#E5484D",
+    },
+    "audience_relevance": {
+        "label": "Audience relevance", "weight": 12,
+        "bg": "#FFE3C7", "border": "#F76B15",
+    },
+    "user_value": {
+        "label": "User value & completeness", "weight": 12,
+        "bg": "#FBE8B4", "border": "#B58A00",
+    },
+    "clarity": {
+        "label": "Clarity", "weight": 10,
+        "bg": "#D5E7FB", "border": "#0090FF",
+    },
+    "readability": {
+        "label": "Readability & plain language", "weight": 10,
+        "bg": "#D9F0F4", "border": "#0894B3",
+    },
+    "professional_tone": {
+        "label": "Professional tone & brand voice", "weight": 9,
+        "bg": "#E9DDFB", "border": "#8E4EC6",
+    },
+    "structure_scannability": {
+        "label": "Structure & scannability", "weight": 8,
+        "bg": "#D8F3DE", "border": "#30A46C",
+    },
+    "language_accuracy": {
+        "label": "Grammar & language accuracy", "weight": 7,
+        "bg": "#FBDCEF", "border": "#D6409F",
+    },
+    "consistency": {
+        "label": "Terminology consistency", "weight": 6,
+        "bg": "#E1E7FF", "border": "#5B5BD6",
+    },
+    "conciseness": {
+        "label": "Conciseness & value density", "weight": 5,
+        "bg": "#E8E8E8", "border": "#6F6F6F",
+    },
+    "inclusivity_accessibility": {
+        "label": "Inclusivity & accessibility", "weight": 4,
+        "bg": "#D7F0E5", "border": "#218358",
+    },
+    "persuasiveness_actionability": {
+        "label": "Persuasiveness & actionability", "weight": 3,
+        "bg": "#F9E1C7", "border": "#C25D05",
+    },
+}
+
+
+QUALITY_SYSTEM = (
+    "You are a senior UK web-content editor and course-page quality reviewer. "
+    "Assess college course overviews using professional UK English and the "
+    "provided scoring rubric. Be evidence-led, learner-focused and conservative "
+    "about factual claims. Do not invent qualification facts. Reply ONLY with "
+    "valid JSON."
+)
+
+QUALITY_PROMPT = """Evaluate the COURSE CONTENT below against all twelve criteria.
+
+SCORING CRITERIA AND WEIGHTS
+- accuracy_credibility: factual precision, supportable claims, no misleading promises (14%)
+- audience_relevance: clear fit for the intended learner and their likely questions (12%)
+- user_value: explains what the course offers, benefits, learning and useful outcomes (12%)
+- clarity: precise, specific and unambiguous writing (10%)
+- readability: plain UK English, manageable sentences, limited jargon (10%)
+- professional_tone: professional, approachable, confident, informative and not over-promotional (9%)
+- structure_scannability: logical order, effective paragraphs, headings/lists where useful (8%)
+- language_accuracy: grammar, spelling, articles, punctuation and sentence construction (7%)
+- consistency: terminology, qualification names, capitalisation and UK English consistency (6%)
+- conciseness: avoids repetition, filler and low-value wording (5%)
+- inclusivity_accessibility: inclusive wording, explained acronyms and broad comprehensibility (4%)
+- persuasiveness_actionability: specific learner benefits and an appropriate next step without pressure (3%)
+
+IMPORTANT RULES
+1. Score EACH criterion from 0 to 100. Do not return weighted points.
+2. A high score requires positive evidence in the content, not merely the absence of errors.
+3. Do not independently verify internet facts. Use only the supplied course context and content.
+4. If a factual or promotional claim is not supported by the supplied context, add it to unverified_claims.
+5. For every issue, "original" MUST be an exact, short substring copied verbatim from the content.
+6. Use only these severity values: critical, major, minor, suggestion.
+7. Use only the exact criterion keys listed above.
+8. The corrected_text must preserve meaning and supplied facts. Do not add unsupported accreditation, salary, career, duration, entry or assessment claims.
+9. Formality is not automatically good: prefer professional, natural and approachable wording.
+10. Return no markdown and no text outside the JSON.
+
+COURSE CONTEXT
+{context}
+
+AUTOMATIC TEXT METRICS
+{metrics}
+
+Return EXACTLY this JSON shape:
+{{
+  "summary": "Two or three sentences explaining the overall quality.",
+  "category_scores": {{
+    "accuracy_credibility": {{"score": 0, "explanation": "..."}},
+    "audience_relevance": {{"score": 0, "explanation": "..."}},
+    "user_value": {{"score": 0, "explanation": "..."}},
+    "clarity": {{"score": 0, "explanation": "..."}},
+    "readability": {{"score": 0, "explanation": "..."}},
+    "professional_tone": {{"score": 0, "explanation": "..."}},
+    "structure_scannability": {{"score": 0, "explanation": "..."}},
+    "language_accuracy": {{"score": 0, "explanation": "..."}},
+    "consistency": {{"score": 0, "explanation": "..."}},
+    "conciseness": {{"score": 0, "explanation": "..."}},
+    "inclusivity_accessibility": {{"score": 0, "explanation": "..."}},
+    "persuasiveness_actionability": {{"score": 0, "explanation": "..."}}
+  }},
+  "strengths": ["..."],
+  "issues": [
+    {{
+      "criterion": "clarity",
+      "severity": "major",
+      "original": "exact substring",
+      "correction": "improved replacement",
+      "explanation": "Why this matters to the webpage user."
+    }}
+  ],
+  "unverified_claims": [
+    {{"claim": "exact or concise claim", "reason": "Why verification is needed."}}
+  ],
+  "human_review_required": false,
+  "corrected_text": "Complete improved version of the supplied content."
+}}
+
+=== COURSE CONTENT TO EVALUATE ===
+{text}
+"""
+
+
+def content_metrics(text: str) -> dict:
+    """Return small, deterministic readability indicators for the UI and AI."""
+    cleaned = re.sub(r"\s+", " ", text or "").strip()
+    words = re.findall(r"\b[\w'-]+\b", cleaned)
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", cleaned) if s.strip()]
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text or "") if p.strip()]
+    sentence_lengths = [len(re.findall(r"\b[\w'-]+\b", s)) for s in sentences]
+    paragraph_lengths = [len(re.findall(r"\b[\w'-]+\b", p)) for p in paragraphs]
+    return {
+        "word_count": len(words),
+        "sentence_count": len(sentences),
+        "paragraph_count": len(paragraphs),
+        "average_sentence_words": round(sum(sentence_lengths) / max(1, len(sentence_lengths)), 1),
+        "long_sentences_25_plus": sum(1 for n in sentence_lengths if n >= 25),
+        "average_paragraph_words": round(sum(paragraph_lengths) / max(1, len(paragraph_lengths)), 1),
+        "estimated_reading_minutes": max(1, round(len(words) / 220)) if words else 0,
+    }
+
+
+def _safe_score(value, default=0) -> int:
+    try:
+        return max(0, min(100, int(round(float(value)))))
+    except (TypeError, ValueError):
+        return default
+
+
+def normalise_quality_result(raw: dict, original_text: str) -> dict:
+    """Normalise model JSON and calculate the weighted score/status in Python."""
+    raw = raw if isinstance(raw, dict) else {}
+    supplied = raw.get("category_scores") or {}
+    if not isinstance(supplied, dict):
+        supplied = {}
+    categories = {}
+    weighted_total = 0.0
+    for key, meta in QUALITY_CRITERIA.items():
+        item = supplied.get(key) or {}
+        if isinstance(item, (int, float, str)):
+            item = {"score": item, "explanation": ""}
+        score = _safe_score(item.get("score"), 0)
+        categories[key] = {
+            "score": score,
+            "explanation": str(item.get("explanation") or "").strip(),
+        }
+        weighted_total += score * meta["weight"] / 100
+
+    issues = []
+    valid_severity = {"critical", "major", "minor", "suggestion"}
+    for issue in raw.get("issues") or []:
+        if not isinstance(issue, dict):
+            continue
+        criterion = str(issue.get("criterion") or "language_accuracy").strip()
+        if criterion not in QUALITY_CRITERIA:
+            criterion = "language_accuracy"
+        severity = str(issue.get("severity") or "minor").strip().lower()
+        if severity not in valid_severity:
+            severity = "minor"
+        original = str(issue.get("original") or "").strip()
+        # Only retain highlights that can actually be located in the source.
+        if original and original not in original_text:
+            original = ""
+        issues.append({
+            "criterion": criterion,
+            "severity": severity,
+            "original": original,
+            "correction": str(issue.get("correction") or "").strip(),
+            "explanation": str(issue.get("explanation") or "").strip(),
+        })
+
+    score = int(round(weighted_total))
+    has_critical_accuracy = any(
+        i["severity"] == "critical" and i["criterion"] == "accuracy_credibility"
+        for i in issues
+    )
+    if score >= 80 and not has_critical_accuracy:
+        status = "Pass"
+    elif score >= 65 and not has_critical_accuracy:
+        status = "Needs Improvement"
+    else:
+        status = "Fail"
+
+    claims = raw.get("unverified_claims") or []
+    normalised_claims = []
+    for claim in claims:
+        if isinstance(claim, str):
+            normalised_claims.append({"claim": claim, "reason": "Requires verification."})
+        elif isinstance(claim, dict):
+            normalised_claims.append({
+                "claim": str(claim.get("claim") or "").strip(),
+                "reason": str(claim.get("reason") or "Requires verification.").strip(),
+            })
+
+    raw_strengths = raw.get("strengths") or []
+    if isinstance(raw_strengths, str):
+        raw_strengths = [raw_strengths]
+    review_flag = raw.get("human_review_required", False)
+    if isinstance(review_flag, str):
+        review_flag = review_flag.strip().lower() in {"true", "yes", "1"}
+
+    return {
+        "overall_score": score,
+        "status": status,
+        "summary": str(raw.get("summary") or "").strip(),
+        "category_scores": categories,
+        "strengths": [str(x).strip() for x in raw_strengths if str(x).strip()],
+        "issues": issues,
+        "unverified_claims": [x for x in normalised_claims if x["claim"]],
+        "human_review_required": bool(review_flag or normalised_claims),
+        "corrected_text": str(raw.get("corrected_text") or original_text).strip(),
+    }
+
+
+def run_quality_review(text: str, context: str = "No additional course context supplied.") -> dict:
+    metrics = content_metrics(text)
+    raw = parse_json_reply(call_ai(
+        QUALITY_PROMPT.format(
+            text=text[:18000],
+            context=context[:5000],
+            metrics=json.dumps(metrics, ensure_ascii=False),
+        ),
+        QUALITY_SYSTEM,
+    ))
+    return normalise_quality_result(raw, text)
+
+
+OVERVIEW_EXTRACT_PROMPT = """Extract only the main course overview or course-description copy from the webpage text below.
+Exclude navigation, pricing, reviews, FAQs, entry requirements, assessment, course curriculum, careers, contact details and footer text.
+Preserve the overview wording exactly as it appears. Do not rewrite or summarise it.
+Reply only with valid JSON in this shape: {{"overview": "..."}}
+
+WEBPAGE TEXT:
+{text}
+"""
+
+
+def ai_extract_overview(page_text: str) -> str:
+    raw = parse_json_reply(call_ai(
+        OVERVIEW_EXTRACT_PROMPT.format(text=page_text[:14000]),
+        "You extract an exact course-overview section from webpage text and reply only with JSON.",
+    ))
+    return str(raw.get("overview") or "").strip()[:6000]
+
+
+def extract_uploaded_content(file) -> str:
+    """Extract text from an uploaded TXT, DOCX or text-based PDF."""
+    if file is None:
+        return ""
+    data = file.getvalue()
+    name = (getattr(file, "name", "") or "").lower()
+    if name.endswith(".txt") or name.endswith(".md"):
+        return data.decode("utf-8", errors="ignore").strip()
+    if name.endswith(".docx"):
+        from docx import Document
+        document = Document(io.BytesIO(data))
+        parts = [p.text.strip() for p in document.paragraphs if p.text.strip()]
+        for table in document.tables:
+            for row in table.rows:
+                line = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+                if line:
+                    parts.append(line)
+        return "\n".join(parts).strip()
+    if name.endswith(".pdf"):
+        text_parts = []
+        try:
+            import pdfplumber
+            with pdfplumber.open(io.BytesIO(data)) as pdf:
+                for page in pdf.pages:
+                    page_text = page.extract_text() or ""
+                    if page_text.strip():
+                        text_parts.append(page_text.strip())
+        except Exception:
+            text_parts = []
+        if not text_parts:
+            try:
+                from pypdf import PdfReader
+                reader = PdfReader(io.BytesIO(data))
+                text_parts = [(page.extract_text() or "").strip() for page in reader.pages]
+            except Exception as exc:
+                raise RuntimeError(f"The PDF could not be read: {exc}") from exc
+        text = "\n\n".join(x for x in text_parts if x).strip()
+        if not text:
+            raise RuntimeError(
+                "No selectable text was found in the PDF. Upload a text-based PDF or DOCX."
+            )
+        return text
+    raise RuntimeError("Unsupported document type. Upload TXT, MD, DOCX or PDF.")
+
+
+def course_quality_context(course: dict) -> str:
+    if not course:
+        return "No additional course context supplied."
+    lines = [
+        f"Course name: {course.get('name') or 'Not supplied'}",
+        f"Course number: {course.get('number') or 'Not supplied'}",
+        f"Level: {course.get('level') or 'Not supplied'}",
+        f"Course type: {course.get('course_type') or 'Not supplied'}",
+        f"Course URL: {course.get('course_url') or 'Not supplied'}",
+        f"Specification URL: {course.get('spec_url') or 'Not supplied'}",
+        f"Excel entry requirements: {course.get('excel_entry') or 'Not supplied'}",
+    ]
+    return "\n".join(lines)
+
+
+def annotate_text_html(text: str, issues: list) -> str:
+    """Return HTML with source issues highlighted and numbered."""
+    escaped = html.escape(text)
+    for n, issue in enumerate(issues, start=1):
+        original = html.escape(str(issue.get("original", "")))
+        if not original:
+            continue
+        criterion = issue.get("criterion", "language_accuracy")
+        style = QUALITY_CRITERIA.get(criterion, QUALITY_CRITERIA["language_accuracy"])
+        tip = html.escape(
+            f"{style['label']} · {issue.get('severity', 'minor').title()}: "
+            f"{issue.get('correction', '')} — {issue.get('explanation', '')}"
+        )
         mark = (
             f'<mark class="qr-mark" style="background:{style["bg"]};'
             f'border-bottom:2px solid {style["border"]};" title="{tip}">'
@@ -2158,15 +2590,23 @@ QR_CSS = """
 }
 .qr-legend span {
   display:inline-block; margin:3px 8px 3px 0; padding:3px 10px; border-radius:999px;
-  font-size:.78rem; font-weight:600;
+  font-size:.76rem; font-weight:600;
 }
 .issue-card {
   border-radius:13px; border:1px solid #D9E2EC; border-left-width:5px;
   padding:12px 16px; margin-bottom:10px; background:#fff;
 }
-.issue-card .cat { font-size:.72rem; font-weight:700; text-transform:uppercase; letter-spacing:.08em;}
+.issue-card .cat { font-size:.72rem; font-weight:700; text-transform:uppercase; letter-spacing:.06em;}
 .issue-card .orig { text-decoration:line-through; color:#B0341F; }
 .issue-card .corr { color:#1D7A46; font-weight:600; }
+.quality-score-row {
+  display:flex; justify-content:space-between; gap:16px; align-items:flex-start;
+  border-bottom:1px solid #E7EDF3; padding:11px 0;
+}
+.quality-score-row:last-child { border-bottom:0; }
+.quality-score-label { font-weight:700; color:#243B53; }
+.quality-score-explanation { color:#627D98; font-size:.88rem; margin-top:2px; }
+.quality-score-number { font-size:1.05rem; font-weight:800; white-space:nowrap; }
 </style>
 """
 
@@ -2674,88 +3114,524 @@ elif page == "✍️ Content Quality":
                        "proofreader's markup.",
                        chip="Editorial review")
 
-    # legend
     legend = "".join(
         f'<span style="background:{v["bg"]};border:1px solid {v["border"]};color:#2A2F3A;">{v["label"]}</span>'
-        for v in QR_CATEGORIES.values()
+        for v in PROOFREAD_CATEGORIES.values()
     )
     st.markdown(f'<div class="qr-legend">{legend}</div>', unsafe_allow_html=True)
     st.write("")
 
-    src = st.radio("Input", ["Paste text", "Upload file (.txt / .docx)"], horizontal=True)
+    src = st.radio(
+        "Input", ["Paste text", "Upload file (.txt / .docx)"],
+        horizontal=True, key="proofread_input_method"
+    )
     text = ""
     if src == "Paste text":
-        text = st.text_area("Course content to review", height=220,
-                            placeholder="Paste the course description, overview or any page copy here…")
+        text = st.text_area(
+            "Course content to review", height=220, key="proofread_pasted_text",
+            placeholder="Paste the course description, overview or any page copy here…"
+        )
     else:
-        f = st.file_uploader("Upload content", type=["txt", "docx"], key="qr_up")
-        if f:
-            if f.name.lower().endswith(".docx"):
+        uploaded = st.file_uploader(
+            "Upload content", type=["txt", "docx"], key="proofread_upload"
+        )
+        if uploaded:
+            if uploaded.name.lower().endswith(".docx"):
                 from docx import Document
-                d = Document(io.BytesIO(f.read()))
-                text = "\n".join(p.text for p in d.paragraphs if p.text.strip())
+                document = Document(io.BytesIO(uploaded.read()))
+                text = "\n".join(
+                    paragraph.text for paragraph in document.paragraphs
+                    if paragraph.text.strip()
+                )
             else:
-                text = f.read().decode("utf-8", errors="ignore")
-            st.text_area("Loaded content", text, height=180)
+                text = uploaded.read().decode("utf-8", errors="ignore")
+            st.text_area(
+                "Loaded content", text, height=180, key="proofread_loaded_content"
+            )
 
-    if st.button("✍️ Review content quality", type="primary", disabled=not text.strip()):
+    if st.button(
+        "✍️ Review content quality", type="primary",
+        disabled=not text.strip(), key="run_proofreading_review"
+    ):
         if not openrouter_api_key():
-            st.error("No OpenRouter API key found — add OPENROUTER_API_KEY to "
-                     "Streamlit Secrets.")
+            st.error(
+                "No OpenRouter API key found — add OPENROUTER_API_KEY to "
+                "Streamlit Secrets."
+            )
         else:
             with st.spinner("Proofreading …"):
                 try:
-                    result = run_quality_review(text)
-                    st.session_state["qr_result"] = result
-                    st.session_state["qr_text"] = text
-                except Exception as e:
-                    st.error(f"Review failed: {e}")
+                    result = run_proofreading_review(text)
+                    st.session_state["proofread_result"] = result
+                    st.session_state["proofread_text"] = text
+                except Exception as exc:
+                    st.error(f"Review failed: {exc}")
 
-    if "qr_result" in st.session_state:
-        result = st.session_state["qr_result"]
-        text = st.session_state["qr_text"]
+    if "proofread_result" in st.session_state:
+        result = st.session_state["proofread_result"]
+        reviewed_text = st.session_state["proofread_text"]
         issues = result.get("issues", [])
 
         c1, c2, c3 = st.columns(3)
         qr_stat(c1, len(issues), "Issues found", "err" if issues else "ok")
-        top_cat = max({i.get("category") for i in issues},
-                      key=lambda c: sum(1 for i in issues if i.get("category") == c),
-                      default="—")
-        qr_stat(c2, QR_CATEGORIES.get(top_cat, {}).get("label", "—"),
-                "Most common issue", "warn")
-        qr_stat(c3, f"{max(0, 100 - len(issues) * 4)}%", "Quality score", "info")
+        top_category = max(
+            {issue.get("category") for issue in issues},
+            key=lambda category: sum(
+                1 for issue in issues if issue.get("category") == category
+            ),
+            default="—",
+        )
+        qr_stat(
+            c2, PROOFREAD_CATEGORIES.get(top_category, {}).get("label", "—"),
+            "Most common issue", "warn"
+        )
+        qr_stat(
+            c3, f"{max(0, 100 - len(issues) * 4)}%",
+            "Quality score", "info"
+        )
         st.write("")
 
-        view_marked, view_fixed, view_list = st.tabs(
-            ["🖍️ Marked-up text", "✅ Corrected text", "📋 Issue list"])
+        marked_tab, fixed_tab, list_tab = st.tabs(
+            ["🖍️ Marked-up text", "✅ Corrected text", "📋 Issue list"]
+        )
 
-        with view_marked:
+        with marked_tab:
             if issues:
-                st.markdown(f'<div class="qr-paper">{annotate_text_html(text, issues)}</div>',
-                            unsafe_allow_html=True)
-                st.caption("Hover a highlight to see the correction and explanation.")
+                st.markdown(
+                    f'<div class="qr-paper">'
+                    f'{annotate_proofreading_html(reviewed_text, issues)}</div>',
+                    unsafe_allow_html=True,
+                )
+                st.caption(
+                    "Hover a highlight to see the correction and explanation."
+                )
             else:
                 st.success("No issues found — this content is clean. 🎉")
 
-        with view_fixed:
-            corrected = result.get("corrected_text", text)
-            st.text_area("Corrected version (copy-ready)", corrected, height=260)
-            st.download_button("⬇️ Download corrected text", corrected,
-                               file_name="corrected_content.txt")
+        with fixed_tab:
+            corrected = result.get("corrected_text", reviewed_text)
+            st.text_area(
+                "Corrected version (copy-ready)", corrected, height=260,
+                key="proofread_corrected_text"
+            )
+            st.download_button(
+                "⬇️ Download corrected text", corrected,
+                file_name="corrected_content.txt", key="proofread_download"
+            )
 
-        with view_list:
+        with list_tab:
             if not issues:
                 st.success("Nothing to list — no issues found.")
-            for n, issue in enumerate(issues, start=1):
-                cat = issue.get("category", "grammar")
-                sty = QR_CATEGORIES.get(cat, QR_CATEGORIES["grammar"])
+            for number, issue in enumerate(issues, start=1):
+                category = issue.get("category", "grammar")
+                style = PROOFREAD_CATEGORIES.get(
+                    category, PROOFREAD_CATEGORIES["grammar"]
+                )
                 st.markdown(
-                    f'<div class="issue-card" style="border-left-color:{sty["border"]}">'
-                    f'<div class="cat" style="color:{sty["border"]}">#{n} · {sty["label"]}</div>'
-                    f'<span class="orig">{html.escape(str(issue.get("original","")))}</span> → '
-                    f'<span class="corr">{html.escape(str(issue.get("correction","")))}</span><br>'
-                    f'<small>{html.escape(str(issue.get("explanation","")))}</small>'
-                    f'</div>', unsafe_allow_html=True)
+                    f'<div class="issue-card" style="border-left-color:{style["border"]}">'
+                    f'<div class="cat" style="color:{style["border"]}">'
+                    f'#{number} · {style["label"]}</div>'
+                    f'<span class="orig">{html.escape(str(issue.get("original", "")))}</span> → '
+                    f'<span class="corr">{html.escape(str(issue.get("correction", "")))}</span><br>'
+                    f'<small>{html.escape(str(issue.get("explanation", "")))}</small>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+
+# ── PAGE: Course Overview Quality ───────────────────────────────────
+elif page == "🧭 Course Overview Quality":
+    st.markdown(QR_CSS, unsafe_allow_html=True)
+    header.page_header(
+        "✍️ Course Overview Quality",
+        "Evaluate course-page content for accuracy, learner relevance, clarity, "
+        "readability, professional tone, structure, consistency and language quality.",
+        chip="Separate quality review",
+    )
+
+    st.caption(
+        "Choose a course imported from the tracker Excel, paste content directly, "
+        "or upload a TXT, DOCX or text-based PDF document."
+    )
+
+    legend = "".join(
+        f'<span style="background:{v["bg"]};border:1px solid {v["border"]};'
+        f'color:#2A2F3A;">{v["label"]} · {v["weight"]}%</span>'
+        for v in QUALITY_CRITERIA.values()
+    )
+    with st.expander("View the quality criteria and weights"):
+        st.markdown(f'<div class="qr-legend">{legend}</div>', unsafe_allow_html=True)
+        st.caption(
+            "The AI gives each criterion a 0–100 score. The application applies "
+            "the fixed weights shown above to calculate the overall result."
+        )
+
+    def evaluate_quality_input(body: str, context: str, source_label: str):
+        if not body or not body.strip():
+            st.error("No course content is available to evaluate.")
+            return
+        if not openrouter_api_key():
+            st.error(
+                "No OpenRouter API key found — add OPENROUTER_API_KEY to "
+                "Streamlit Secrets."
+            )
+            return
+        with st.spinner("Evaluating course-content quality …"):
+            try:
+                result = run_quality_review(body.strip(), context)
+                st.session_state["qr_result"] = result
+                st.session_state["qr_text"] = body.strip()
+                st.session_state["qr_context"] = context
+                st.session_state["qr_source_label"] = source_label
+                st.session_state["quality_corrected_output"] = result.get("corrected_text") or body.strip()
+            except Exception as exc:
+                st.error(f"Quality evaluation failed: {exc}")
+
+    input_course, input_paste, input_upload = st.tabs([
+        "🌐 Select course from Excel",
+        "✍️ Paste content",
+        "📄 Upload document",
+    ])
+
+    with input_course:
+        courses = all_courses()
+        if not courses:
+            st.info(
+                "No courses are available yet. Import the tracker Excel in "
+                "📥 Upload & Specs; the course list will appear here automatically."
+            )
+            if st.button("Go to Upload & Specs", key="quality_go_upload"):
+                st.session_state["main_navigation"] = "📥 Upload & Specs"
+                st.rerun()
+        else:
+            levels = sorted({c["level"] for c in courses if c.get("level")})
+            types = sorted({c["course_type"] for c in courses if c.get("course_type")})
+            qf1, qf2, qf3 = st.columns([1, 1, 2])
+            q_level = qf1.selectbox(
+                "Level", ["All"] + levels, key="quality_course_level"
+            )
+            q_type = qf2.selectbox(
+                "Type", ["All"] + types, key="quality_course_type"
+            )
+            q_search = qf3.text_input(
+                "Search course name", key="quality_course_search",
+                placeholder="Start typing a course name…",
+            )
+            filtered_courses = [
+                c for c in courses
+                if (q_level == "All" or c.get("level") == q_level)
+                and (q_type == "All" or c.get("course_type") == q_type)
+                and q_search.lower() in (c.get("name") or "").lower()
+            ]
+            if not filtered_courses:
+                st.warning("No courses match the selected filters.")
+            else:
+                selected = st.selectbox(
+                    "Course from the imported Excel tracker",
+                    filtered_courses,
+                    format_func=lambda c: (
+                        f"{c['number']} — {c['name']}" if c.get("number") else c["name"]
+                    ),
+                    key="quality_selected_course",
+                )
+                selected_course = get_course(selected["id"])
+                st.markdown(
+                    f"**Course URL:** {selected_course.get('course_url') or '—'}  \n"
+                    f"**Level / Type:** {selected_course.get('level') or '—'} · "
+                    f"{selected_course.get('course_type') or '—'}"
+                )
+
+                if st.button(
+                    "🌐 Load webpage overview",
+                    type="secondary",
+                    key="quality_load_course_overview",
+                ):
+                    with st.spinner("Reading the selected course webpage …"):
+                        try:
+                            overview, full_page_text = extract_page_overview(
+                                selected_course["course_url"]
+                            )
+                            if len(overview.strip()) < 80 and openrouter_api_key():
+                                try:
+                                    ai_overview = ai_extract_overview(full_page_text)
+                                    if len(ai_overview) > len(overview):
+                                        overview = ai_overview
+                                except Exception:
+                                    pass
+                            if not overview.strip():
+                                raise RuntimeError(
+                                    "No course overview or course-description section "
+                                    "could be extracted from this webpage."
+                                )
+                            st.session_state["quality_course_text"] = overview.strip()
+                            st.session_state["quality_course_editor"] = overview.strip()
+                            st.session_state["quality_course_loaded_id"] = selected_course["id"]
+                            st.session_state["quality_course_loaded_name"] = selected_course["name"]
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Could not load the webpage overview: {exc}")
+
+                loaded_text = st.session_state.get("quality_course_text", "")
+                loaded_id = st.session_state.get("quality_course_loaded_id")
+                if loaded_text and loaded_id == selected_course["id"]:
+                    st.success(
+                        f"Overview loaded for {st.session_state.get('quality_course_loaded_name', selected_course['name'])}."
+                    )
+                    if "quality_course_editor" not in st.session_state:
+                        st.session_state["quality_course_editor"] = loaded_text
+                    course_text = st.text_area(
+                        "Extracted overview — review or edit before evaluation",
+                        height=260,
+                        key="quality_course_editor",
+                    )
+                    if st.button(
+                        "🔍 Evaluate selected course overview",
+                        type="primary",
+                        key="quality_evaluate_course",
+                    ):
+                        evaluate_quality_input(
+                            course_text,
+                            course_quality_context(selected_course),
+                            selected_course["name"],
+                        )
+                elif loaded_text:
+                    st.info(
+                        "A different course overview is currently loaded. Select that "
+                        "course again or click ‘Load webpage overview’ for this course."
+                    )
+
+    with input_paste:
+        paste_name = st.text_input(
+            "Course name or page title (optional)",
+            key="quality_paste_name",
+            placeholder="e.g. NCFE CACHE Level 2 Diploma in Care",
+        )
+        pasted_text = st.text_area(
+            "Paste the course overview or webpage content",
+            height=300,
+            key="quality_pasted_text",
+            placeholder="Paste the course description, overview or other course-page copy here…",
+        )
+        if st.button(
+            "🔍 Evaluate pasted content",
+            type="primary",
+            disabled=not pasted_text.strip(),
+            key="quality_evaluate_paste",
+        ):
+            context = (
+                f"Course/page title supplied by the user: {paste_name}"
+                if paste_name.strip() else "No additional course context supplied."
+            )
+            evaluate_quality_input(
+                pasted_text,
+                context,
+                paste_name.strip() or "Pasted course content",
+            )
+
+    with input_upload:
+        upload_name = st.text_input(
+            "Course name or page title (optional)",
+            key="quality_upload_name",
+            placeholder="Used as context for the evaluation",
+        )
+        uploaded_doc = st.file_uploader(
+            "Upload course content",
+            type=["txt", "md", "docx", "pdf"],
+            key="quality_document_upload",
+        )
+        upload_ui.info(
+            ".txt · .md · .docx · .pdf",
+            "PDFs must contain selectable text; scanned-image PDFs are not supported.",
+        )
+        uploaded_text = ""
+        if uploaded_doc:
+            upload_ui.file_details(uploaded_doc)
+            try:
+                uploaded_text = extract_uploaded_content(uploaded_doc)
+                upload_preview_key = (
+                    "quality_uploaded_preview_"
+                    + hashlib.sha1(uploaded_doc.getvalue()).hexdigest()[:10]
+                )
+                st.text_area(
+                    "Extracted document text",
+                    value=uploaded_text,
+                    height=260,
+                    disabled=True,
+                    key=upload_preview_key,
+                )
+            except Exception as exc:
+                st.error(str(exc))
+        if st.button(
+            "🔍 Evaluate uploaded document",
+            type="primary",
+            disabled=not uploaded_text.strip(),
+            key="quality_evaluate_upload",
+        ):
+            context = (
+                f"Course/page title supplied by the user: {upload_name}\n"
+                f"Uploaded document: {uploaded_doc.name}"
+                if upload_name.strip()
+                else f"Uploaded document: {uploaded_doc.name}"
+            )
+            evaluate_quality_input(
+                uploaded_text,
+                context,
+                upload_name.strip() or uploaded_doc.name,
+            )
+
+    if "qr_result" in st.session_state:
+        st.divider()
+        result = st.session_state["qr_result"]
+        reviewed_text = st.session_state.get("qr_text", "")
+        source_label = st.session_state.get("qr_source_label", "Course content")
+        issues = result.get("issues", [])
+        claims = result.get("unverified_claims", [])
+        metrics = content_metrics(reviewed_text)
+
+        st.subheader(f"Quality result — {source_label}")
+        status_kind = {
+            "Pass": "ok", "Needs Improvement": "warn", "Fail": "err"
+        }.get(result.get("status"), "info")
+        r1, r2, r3, r4 = st.columns(4)
+        qr_stat(r1, f"{result.get('overall_score', 0)}%", "Overall quality", status_kind)
+        qr_stat(r2, result.get("status", "—"), "Status", status_kind)
+        qr_stat(r3, len(issues), "Issues identified", "err" if issues else "ok")
+        qr_stat(r4, len(claims), "Claims to verify", "warn" if claims else "ok")
+
+        if result.get("summary"):
+            st.markdown(f"> {result['summary']}")
+        if result.get("human_review_required"):
+            st.warning(
+                "Human review is recommended, particularly for factual or promotional "
+                "claims that could not be verified from the supplied context."
+            )
+
+        m1, m2, m3, m4 = st.columns(4)
+        qr_stat(m1, metrics["word_count"], "Words", "info")
+        qr_stat(m2, metrics["average_sentence_words"], "Avg. words / sentence", "info")
+        qr_stat(m3, metrics["long_sentences_25_plus"], "Sentences 25+ words", "warn")
+        qr_stat(m4, metrics["paragraph_count"], "Paragraphs", "info")
+
+        result_overview, result_scores, result_marked, result_issues, result_rewrite = st.tabs([
+            "📌 Overview",
+            "📊 Category scores",
+            "🖍️ Highlighted text",
+            "📋 Issues",
+            "✅ Improved version",
+        ])
+
+        with result_overview:
+            left, right = st.columns(2)
+            with left:
+                st.markdown("#### Strengths")
+                strengths = result.get("strengths") or []
+                if strengths:
+                    for strength in strengths:
+                        st.markdown(f"- {strength}")
+                else:
+                    st.caption("No specific strengths were returned.")
+            with right:
+                st.markdown("#### Priority improvements")
+                priority = [i for i in issues if i.get("severity") in {"critical", "major"}]
+                priority = priority or issues[:5]
+                if priority:
+                    for item in priority[:6]:
+                        label = QUALITY_CRITERIA[item["criterion"]]["label"]
+                        st.markdown(
+                            f"- **{item['severity'].title()} · {label}:** "
+                            f"{item.get('explanation') or item.get('correction') or 'Review this wording.'}"
+                        )
+                else:
+                    st.success("No priority issues were identified.")
+
+            st.markdown("#### Unverified claims")
+            if claims:
+                for claim in claims:
+                    st.markdown(
+                        f"- **{claim.get('claim', 'Claim')}** — "
+                        f"{claim.get('reason', 'Requires verification.')}"
+                    )
+            else:
+                st.success("No unverified factual or promotional claims were flagged.")
+
+        with result_scores:
+            for key, meta in QUALITY_CRITERIA.items():
+                item = result.get("category_scores", {}).get(key, {})
+                score = item.get("score", 0)
+                explanation = html.escape(str(item.get("explanation") or ""))
+                st.markdown(
+                    f'<div class="quality-score-row">'
+                    f'<div><div class="quality-score-label">{meta["label"]} '
+                    f'<span style="color:#829AB1;font-weight:600">({meta["weight"]}% weight)</span></div>'
+                    f'<div class="quality-score-explanation">{explanation}</div></div>'
+                    f'<div class="quality-score-number" style="color:{meta["border"]}">{score}/100</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+        with result_marked:
+            highlightable = [i for i in issues if i.get("original")]
+            if highlightable:
+                st.markdown(
+                    f'<div class="qr-paper">{annotate_text_html(reviewed_text, highlightable)}</div>',
+                    unsafe_allow_html=True,
+                )
+                st.caption("Hover over a highlight to see its correction and explanation.")
+            elif issues:
+                st.info(
+                    "Issues were identified, but the AI did not return exact source "
+                    "substrings that could be highlighted safely. See the Issues tab."
+                )
+            else:
+                st.success("No text-level issues were identified.")
+
+        with result_issues:
+            if not issues:
+                st.success("No issues were identified.")
+            for n, issue in enumerate(issues, start=1):
+                criterion = issue.get("criterion", "language_accuracy")
+                style = QUALITY_CRITERIA.get(
+                    criterion, QUALITY_CRITERIA["language_accuracy"]
+                )
+                original = html.escape(str(issue.get("original") or ""))
+                correction = html.escape(str(issue.get("correction") or ""))
+                comparison = ""
+                if original or correction:
+                    comparison = (
+                        f'<span class="orig">{original or "—"}</span> → '
+                        f'<span class="corr">{correction or "—"}</span><br>'
+                    )
+                st.markdown(
+                    f'<div class="issue-card" style="border-left-color:{style["border"]}">'
+                    f'<div class="cat" style="color:{style["border"]}">#{n} · '
+                    f'{html.escape(issue.get("severity", "minor").title())} · {style["label"]}</div>'
+                    f'{comparison}'
+                    f'<small>{html.escape(str(issue.get("explanation") or ""))}</small>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+        with result_rewrite:
+            corrected = result.get("corrected_text") or reviewed_text
+            st.caption(
+                "The improved version preserves the supplied meaning and should still "
+                "be checked against authoritative qualification information before publishing."
+            )
+            if "quality_corrected_output" not in st.session_state:
+                st.session_state["quality_corrected_output"] = corrected
+            st.text_area(
+                "Improved course content (copy-ready)",
+                height=360,
+                key="quality_corrected_output",
+            )
+            safe_name = re.sub(r"[^A-Za-z0-9]+", "_", source_label).strip("_")[:60]
+            st.download_button(
+                "⬇️ Download improved text",
+                st.session_state.get("quality_corrected_output", corrected),
+                file_name=f"{safe_name or 'course_content'}_improved.txt",
+                mime="text/plain",
+                key="quality_download_corrected",
+            )
 
 
 # ── PAGE: Manage Data ───────────────────────────────────────────────

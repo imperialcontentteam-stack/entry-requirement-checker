@@ -3,7 +3,8 @@
 import streamlit as st
 
 PAGES = ["📥 Upload & Specs", "▶️ Run Check", "📄 Reports",
-         "✍️ Content Quality", "🗂️ Manage Data"]
+         "✍️ Content Quality", "🧭 Course Overview Quality",
+         "🗂️ Manage Data"]
 
 
 def render(version: str, api_key_present: bool) -> str:
@@ -45,7 +46,7 @@ def render(version: str, api_key_present: bool) -> str:
             <div class="sb-footer">
               <span class="version-pill">Version {version}</span><br>
               Compare course pages with qualification specifications, create
-              reports, and proofread content from one workspace.
+              reports, proofread content, and evaluate course-overview quality from one workspace.
             </div>
             """,
             unsafe_allow_html=True,
