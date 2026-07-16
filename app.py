@@ -17,8 +17,8 @@ Workflow
 4. A Pass/Fail report is shown and downloadable as PDF.
 5. The original Content Quality Review remains available for proofreading.
 6. A separate Course Overview Quality page can load a selected tracker course's
-   webpage overview, accept pasted text, or extract TXT/DOCX/PDF content for
-   a weighted AI quality evaluation and improved copy.
+   webpage overview, accept pasted text, or extract the Course Overview from
+   TXT/DOCX/PDF content for an editorial quality evaluation and improved copy.
 
 Persistence
 -----------
@@ -275,7 +275,7 @@ RED = "#DC2626"
 GREEN = "#16A34A"
 AMBER = "#D97706"
 
-APP_VERSION = "2.2.1"
+APP_VERSION = "2.2.3"
 EXTRACTION_VERSION = "2.0.3-pdf1"
 ENTRY_WORDING_VERSION = "2.1.4-relevant1"
 
@@ -2217,97 +2217,87 @@ def annotate_proofreading_html(text: str, issues: list) -> str:
 #  COURSE OVERVIEW QUALITY REVIEW
 # ═══════════════════════════════════════════════════════════════════
 
-# The AI scores every criterion from 0-100. Python applies the fixed weights
-# below so the overall result is consistent across model responses.
+# The AI scores each editorial criterion from 0-100. The overall score is the
+# simple average of the criteria; no source article or external standard assigns
+# percentage weights to these checks.
 QUALITY_CRITERIA = {
-    "accuracy_credibility": {
-        "label": "Accuracy & credibility", "weight": 14,
-        "bg": "#FDD8D6", "border": "#E5484D",
+    "professional_tone": {
+        "label": "Professional tone", "bg": "#E9DDFB", "border": "#8E4EC6",
     },
-    "audience_relevance": {
-        "label": "Audience relevance", "weight": 12,
-        "bg": "#FFE3C7", "border": "#F76B15",
-    },
-    "user_value": {
-        "label": "User value & completeness", "weight": 12,
-        "bg": "#FBE8B4", "border": "#B58A00",
+    "appropriate_formality": {
+        "label": "Appropriate formality", "bg": "#FBDCEF", "border": "#D6409F",
     },
     "clarity": {
-        "label": "Clarity", "weight": 10,
-        "bg": "#D5E7FB", "border": "#0090FF",
+        "label": "Clarity", "bg": "#D5E7FB", "border": "#0090FF",
     },
     "readability": {
-        "label": "Readability & plain language", "weight": 10,
-        "bg": "#D9F0F4", "border": "#0894B3",
+        "label": "Readability & plain language", "bg": "#D9F0F4", "border": "#0894B3",
     },
-    "professional_tone": {
-        "label": "Professional tone & brand voice", "weight": 9,
-        "bg": "#E9DDFB", "border": "#8E4EC6",
+    "learner_focus": {
+        "label": "Learner-focused writing", "bg": "#FFE3C7", "border": "#F76B15",
     },
-    "structure_scannability": {
-        "label": "Structure & scannability", "weight": 8,
-        "bg": "#D8F3DE", "border": "#30A46C",
+    "course_purpose": {
+        "label": "Clear course purpose", "bg": "#FBE8B4", "border": "#B58A00",
+    },
+    "learner_benefits": {
+        "label": "Clear learner benefits", "bg": "#D7F0E5", "border": "#218358",
+    },
+    "structure_flow": {
+        "label": "Structure & flow", "bg": "#D8F3DE", "border": "#30A46C",
+    },
+    "conciseness_repetition": {
+        "label": "Conciseness & repetition", "bg": "#E8E8E8", "border": "#6F6F6F",
     },
     "language_accuracy": {
-        "label": "Grammar & language accuracy", "weight": 7,
-        "bg": "#FBDCEF", "border": "#D6409F",
+        "label": "Grammar & sentence quality", "bg": "#FDD8D6", "border": "#E5484D",
     },
-    "consistency": {
-        "label": "Terminology consistency", "weight": 6,
-        "bg": "#E1E7FF", "border": "#5B5BD6",
+    "consistency_uk_english": {
+        "label": "Consistency & UK English", "bg": "#E1E7FF", "border": "#5B5BD6",
     },
-    "conciseness": {
-        "label": "Conciseness & value density", "weight": 5,
-        "bg": "#E8E8E8", "border": "#6F6F6F",
-    },
-    "inclusivity_accessibility": {
-        "label": "Inclusivity & accessibility", "weight": 4,
-        "bg": "#D7F0E5", "border": "#218358",
-    },
-    "persuasiveness_actionability": {
-        "label": "Persuasiveness & actionability", "weight": 3,
-        "bg": "#F9E1C7", "border": "#C25D05",
+    "promotional_balance": {
+        "label": "Promotional balance & specificity", "bg": "#F9E1C7", "border": "#C25D05",
     },
 }
 
 
 QUALITY_SYSTEM = (
-    "You are a senior UK web-content editor and course-page quality reviewer. "
-    "Assess college course overviews using professional UK English and the "
-    "provided scoring rubric. Be evidence-led, learner-focused and conservative "
-    "about factual claims. Do not invent qualification facts. Reply ONLY with "
-    "valid JSON."
+    "You are a senior UK web-content editor. Review only the writing quality "
+    "of a college course overview. Do not fact-check qualification claims, "
+    "accreditation, credits, duration, progression, careers or other course facts. "
+    "Reply ONLY with valid JSON."
 )
 
-QUALITY_PROMPT = """Evaluate the COURSE CONTENT below against all twelve criteria.
+QUALITY_PROMPT = """Evaluate only the writing quality of the COURSE OVERVIEW below against all twelve editorial criteria.
 
-SCORING CRITERIA AND WEIGHTS
-- accuracy_credibility: factual precision, supportable claims, no misleading promises (14%)
-- audience_relevance: clear fit for the intended learner and their likely questions (12%)
-- user_value: explains what the course offers, benefits, learning and useful outcomes (12%)
-- clarity: precise, specific and unambiguous writing (10%)
-- readability: plain UK English, manageable sentences, limited jargon (10%)
-- professional_tone: professional, approachable, confident, informative and not over-promotional (9%)
-- structure_scannability: logical order, effective paragraphs, headings/lists where useful (8%)
-- language_accuracy: grammar, spelling, articles, punctuation and sentence construction (7%)
-- consistency: terminology, qualification names, capitalisation and UK English consistency (6%)
-- conciseness: avoids repetition, filler and low-value wording (5%)
-- inclusivity_accessibility: inclusive wording, explained acronyms and broad comprehensibility (4%)
-- persuasiveness_actionability: specific learner benefits and an appropriate next step without pressure (3%)
+EDITORIAL CRITERIA
+- professional_tone: professional, confident, approachable and suitable for a college website
+- appropriate_formality: neither too casual nor unnecessarily academic, stiff or elaborate
+- clarity: precise, specific and easy to understand without ambiguous or vague wording
+- readability: plain UK English, manageable sentence length, limited jargon and smooth reading
+- learner_focus: speaks to the prospective learner and addresses their interests rather than focusing mainly on the provider
+- course_purpose: quickly and clearly explains what the course is and what it covers
+- learner_benefits: clearly communicates useful knowledge, skills, outcomes or progression value for the learner
+- structure_flow: logical paragraph order, effective opening, coherent transitions and a suitable ending
+- conciseness_repetition: avoids repeated ideas, repeated words, filler and unnecessary wording
+- language_accuracy: sound grammar, spelling, punctuation, articles and sentence construction
+- consistency_uk_english: consistent terminology, capitalisation, hyphenation, point of view and UK English
+- promotional_balance: persuasive but not exaggerated, generic, sales-heavy or filled with unsupported-sounding superlatives
 
-IMPORTANT RULES
-1. Score EACH criterion from 0 to 100. Do not return weighted points.
-2. A high score requires positive evidence in the content, not merely the absence of errors.
-3. Do not independently verify internet facts. Use only the supplied course context and content.
-4. If a factual or promotional claim is not supported by the supplied context, add it to unverified_claims.
-5. For every issue, "original" MUST be an exact, short substring copied verbatim from the content.
-6. Use only these severity values: critical, major, minor, suggestion.
-7. Use only the exact criterion keys listed above.
-8. The corrected_text must preserve meaning and supplied facts. Do not add unsupported accreditation, salary, career, duration, entry or assessment claims.
-9. Formality is not automatically good: prefer professional, natural and approachable wording.
-10. Return no markdown and no text outside the JSON.
+IMPORTANT SCOPE RULES
+1. Review only how the Course Overview is written.
+2. Do NOT check whether factual statements are true or ask for evidence, sources or human review.
+3. Do NOT assess entry requirements, assessment methods or other webpage sections.
+4. Score EACH criterion from 0 to 100. The application calculates the overall score as an equal average.
+5. A high score requires positive evidence in the wording, not merely the absence of errors.
+6. For every issue, "original" MUST be an exact, short substring copied verbatim from the overview.
+7. Use only these severity values: major, minor, suggestion.
+8. Use only the exact criterion keys listed above.
+9. The corrected_text must preserve all supplied course facts and meaning. Improve only the wording, organisation and readability.
+10. Formality is not automatically good: prefer professional, natural and approachable wording.
+11. Do not add new course facts, accreditation, salary, duration, entry, assessment or career claims.
+12. Return no markdown and no text outside the JSON.
 
-COURSE CONTEXT
+COURSE TITLE CONTEXT
 {context}
 
 AUTOMATIC TEXT METRICS
@@ -2315,20 +2305,20 @@ AUTOMATIC TEXT METRICS
 
 Return EXACTLY this JSON shape:
 {{
-  "summary": "Two or three sentences explaining the overall quality.",
+  "summary": "Two or three sentences explaining the overall writing quality.",
   "category_scores": {{
-    "accuracy_credibility": {{"score": 0, "explanation": "..."}},
-    "audience_relevance": {{"score": 0, "explanation": "..."}},
-    "user_value": {{"score": 0, "explanation": "..."}},
+    "professional_tone": {{"score": 0, "explanation": "..."}},
+    "appropriate_formality": {{"score": 0, "explanation": "..."}},
     "clarity": {{"score": 0, "explanation": "..."}},
     "readability": {{"score": 0, "explanation": "..."}},
-    "professional_tone": {{"score": 0, "explanation": "..."}},
-    "structure_scannability": {{"score": 0, "explanation": "..."}},
+    "learner_focus": {{"score": 0, "explanation": "..."}},
+    "course_purpose": {{"score": 0, "explanation": "..."}},
+    "learner_benefits": {{"score": 0, "explanation": "..."}},
+    "structure_flow": {{"score": 0, "explanation": "..."}},
+    "conciseness_repetition": {{"score": 0, "explanation": "..."}},
     "language_accuracy": {{"score": 0, "explanation": "..."}},
-    "consistency": {{"score": 0, "explanation": "..."}},
-    "conciseness": {{"score": 0, "explanation": "..."}},
-    "inclusivity_accessibility": {{"score": 0, "explanation": "..."}},
-    "persuasiveness_actionability": {{"score": 0, "explanation": "..."}}
+    "consistency_uk_english": {{"score": 0, "explanation": "..."}},
+    "promotional_balance": {{"score": 0, "explanation": "..."}}
   }},
   "strengths": ["..."],
   "issues": [
@@ -2337,17 +2327,13 @@ Return EXACTLY this JSON shape:
       "severity": "major",
       "original": "exact substring",
       "correction": "improved replacement",
-      "explanation": "Why this matters to the webpage user."
+      "explanation": "Why this wording reduces the quality of the overview."
     }}
   ],
-  "unverified_claims": [
-    {{"claim": "exact or concise claim", "reason": "Why verification is needed."}}
-  ],
-  "human_review_required": false,
-  "corrected_text": "Complete improved version of the supplied content."
+  "corrected_text": "Complete improved version of the supplied Course Overview."
 }}
 
-=== COURSE CONTENT TO EVALUATE ===
+=== COURSE OVERVIEW TO EVALUATE ===
 {text}
 """
 
@@ -2379,14 +2365,14 @@ def _safe_score(value, default=0) -> int:
 
 
 def normalise_quality_result(raw: dict, original_text: str) -> dict:
-    """Normalise model JSON and calculate the weighted score/status in Python."""
+    """Normalise model JSON and calculate an equal-average editorial score."""
     raw = raw if isinstance(raw, dict) else {}
     supplied = raw.get("category_scores") or {}
     if not isinstance(supplied, dict):
         supplied = {}
     categories = {}
-    weighted_total = 0.0
-    for key, meta in QUALITY_CRITERIA.items():
+    score_values = []
+    for key in QUALITY_CRITERIA:
         item = supplied.get(key) or {}
         if isinstance(item, (int, float, str)):
             item = {"score": item, "explanation": ""}
@@ -2395,10 +2381,10 @@ def normalise_quality_result(raw: dict, original_text: str) -> dict:
             "score": score,
             "explanation": str(item.get("explanation") or "").strip(),
         }
-        weighted_total += score * meta["weight"] / 100
+        score_values.append(score)
 
     issues = []
-    valid_severity = {"critical", "major", "minor", "suggestion"}
+    valid_severity = {"major", "minor", "suggestion"}
     for issue in raw.get("issues") or []:
         if not isinstance(issue, dict):
             continue
@@ -2409,7 +2395,6 @@ def normalise_quality_result(raw: dict, original_text: str) -> dict:
         if severity not in valid_severity:
             severity = "minor"
         original = str(issue.get("original") or "").strip()
-        # Only retain highlights that can actually be located in the source.
         if original and original not in original_text:
             original = ""
         issues.append({
@@ -2420,36 +2405,17 @@ def normalise_quality_result(raw: dict, original_text: str) -> dict:
             "explanation": str(issue.get("explanation") or "").strip(),
         })
 
-    score = int(round(weighted_total))
-    has_critical_accuracy = any(
-        i["severity"] == "critical" and i["criterion"] == "accuracy_credibility"
-        for i in issues
-    )
-    if score >= 80 and not has_critical_accuracy:
+    score = int(round(sum(score_values) / max(1, len(score_values))))
+    if score >= 80:
         status = "Pass"
-    elif score >= 65 and not has_critical_accuracy:
+    elif score >= 65:
         status = "Needs Improvement"
     else:
         status = "Fail"
 
-    claims = raw.get("unverified_claims") or []
-    normalised_claims = []
-    for claim in claims:
-        if isinstance(claim, str):
-            normalised_claims.append({"claim": claim, "reason": "Requires verification."})
-        elif isinstance(claim, dict):
-            normalised_claims.append({
-                "claim": str(claim.get("claim") or "").strip(),
-                "reason": str(claim.get("reason") or "Requires verification.").strip(),
-            })
-
     raw_strengths = raw.get("strengths") or []
     if isinstance(raw_strengths, str):
         raw_strengths = [raw_strengths]
-    review_flag = raw.get("human_review_required", False)
-    if isinstance(review_flag, str):
-        review_flag = review_flag.strip().lower() in {"true", "yes", "1"}
-
     return {
         "overall_score": score,
         "status": status,
@@ -2457,8 +2423,6 @@ def normalise_quality_result(raw: dict, original_text: str) -> dict:
         "category_scores": categories,
         "strengths": [str(x).strip() for x in raw_strengths if str(x).strip()],
         "issues": issues,
-        "unverified_claims": [x for x in normalised_claims if x["claim"]],
-        "human_review_required": bool(review_flag or normalised_claims),
         "corrected_text": str(raw.get("corrected_text") or original_text).strip(),
     }
 
@@ -2492,6 +2456,32 @@ def ai_extract_overview(page_text: str) -> str:
         "You extract an exact course-overview section from webpage text and reply only with JSON.",
     ))
     return str(raw.get("overview") or "").strip()[:6000]
+
+
+def extract_course_overview_section(text: str) -> str:
+    """Return only the Course Overview section from pasted or uploaded text.
+
+    When no overview heading is present, the supplied text is treated as the
+    overview itself. This supports users who paste only the section body.
+    """
+    source = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not source:
+        return ""
+    stop_headings = _stop_re(PAGE_NEXT_AFTER_OVERVIEW)
+    overview = heuristic_section(
+        source,
+        r"course\s+overview",
+        stop_headings,
+        max_chars=12000,
+    )
+    if not overview:
+        overview = heuristic_section(
+            source,
+            OVERVIEW_HEADING,
+            stop_headings,
+            max_chars=12000,
+        )
+    return (overview or source).strip()[:12000]
 
 
 def extract_uploaded_content(file) -> str:
@@ -2541,16 +2531,12 @@ def extract_uploaded_content(file) -> str:
 
 def course_quality_context(course: dict) -> str:
     if not course:
-        return "No additional course context supplied."
-    lines = [
-        f"Course name: {course.get('name') or 'Not supplied'}",
-        f"Course number: {course.get('number') or 'Not supplied'}",
-        f"Level: {course.get('level') or 'Not supplied'}",
-        f"Course type: {course.get('course_type') or 'Not supplied'}",
-        f"Course URL: {course.get('course_url') or 'Not supplied'}",
-        f"Specification URL: {course.get('spec_url') or 'Not supplied'}",
-        f"Excel entry requirements: {course.get('excel_entry') or 'Not supplied'}",
-    ]
+        return "No course title was supplied."
+    lines = [f"Course title: {course.get('name') or 'Not supplied'}"]
+    if course.get("level"):
+        lines.append(f"Level: {course.get('level')}")
+    if course.get("course_type"):
+        lines.append(f"Course type: {course.get('course_type')}")
     return "\n".join(lines)
 
 
@@ -3244,31 +3230,31 @@ elif page == "🧭 Course Overview Quality":
     st.markdown(QR_CSS, unsafe_allow_html=True)
     header.page_header(
         "✍️ Course Overview Quality",
-        "Evaluate course-page content for accuracy, learner relevance, clarity, "
-        "readability, professional tone, structure, consistency and language quality.",
+        "Evaluate only the writing quality of the Course Overview section, including "
+        "tone, clarity, readability, learner focus, flow and consistency.",
         chip="Separate quality review",
     )
 
     st.caption(
-        "Choose a course imported from the tracker Excel, paste content directly, "
-        "or upload a TXT, DOCX or text-based PDF document."
+        "Choose a course from the imported Excel tracker, paste a Course Overview, "
+        "or upload a document containing a Course Overview section."
     )
 
     legend = "".join(
         f'<span style="background:{v["bg"]};border:1px solid {v["border"]};'
-        f'color:#2A2F3A;">{v["label"]} · {v["weight"]}%</span>'
+        f'color:#2A2F3A;">{v["label"]}</span>'
         for v in QUALITY_CRITERIA.values()
     )
-    with st.expander("View the quality criteria and weights"):
+    with st.expander("View the Course Overview quality criteria"):
         st.markdown(f'<div class="qr-legend">{legend}</div>', unsafe_allow_html=True)
         st.caption(
-            "The AI gives each criterion a 0–100 score. The application applies "
-            "the fixed weights shown above to calculate the overall result."
+            "Each editorial criterion receives a 0-100 score. The overall score "
+            "is the simple average of all criteria; no custom percentage weights are used."
         )
 
     def evaluate_quality_input(body: str, context: str, source_label: str):
         if not body or not body.strip():
-            st.error("No course content is available to evaluate.")
+            st.error("No Course Overview is available to evaluate.")
             return
         if not openrouter_api_key():
             st.error(
@@ -3276,7 +3262,7 @@ elif page == "🧭 Course Overview Quality":
                 "Streamlit Secrets."
             )
             return
-        with st.spinner("Evaluating course-content quality …"):
+        with st.spinner("Evaluating Course Overview quality …"):
             try:
                 result = run_quality_review(body.strip(), context)
                 st.session_state["qr_result"] = result
@@ -3407,13 +3393,13 @@ elif page == "🧭 Course Overview Quality":
             placeholder="e.g. NCFE CACHE Level 2 Diploma in Care",
         )
         pasted_text = st.text_area(
-            "Paste the course overview or webpage content",
+            "Paste the Course Overview",
             height=300,
             key="quality_pasted_text",
-            placeholder="Paste the course description, overview or other course-page copy here…",
+            placeholder="Paste the Course Overview text here…",
         )
         if st.button(
-            "🔍 Evaluate pasted content",
+            "🔍 Evaluate pasted overview",
             type="primary",
             disabled=not pasted_text.strip(),
             key="quality_evaluate_paste",
@@ -3422,10 +3408,11 @@ elif page == "🧭 Course Overview Quality":
                 f"Course/page title supplied by the user: {paste_name}"
                 if paste_name.strip() else "No additional course context supplied."
             )
+            overview_text = extract_course_overview_section(pasted_text)
             evaluate_quality_input(
-                pasted_text,
+                overview_text,
                 context,
-                paste_name.strip() or "Pasted course content",
+                paste_name.strip() or "Pasted Course Overview",
             )
 
     with input_upload:
@@ -3435,7 +3422,7 @@ elif page == "🧭 Course Overview Quality":
             placeholder="Used as context for the evaluation",
         )
         uploaded_doc = st.file_uploader(
-            "Upload course content",
+            "Upload a document containing the Course Overview",
             type=["txt", "md", "docx", "pdf"],
             key="quality_document_upload",
         )
@@ -3444,17 +3431,19 @@ elif page == "🧭 Course Overview Quality":
             "PDFs must contain selectable text; scanned-image PDFs are not supported.",
         )
         uploaded_text = ""
+        uploaded_overview = ""
         if uploaded_doc:
             upload_ui.file_details(uploaded_doc)
             try:
                 uploaded_text = extract_uploaded_content(uploaded_doc)
+                uploaded_overview = extract_course_overview_section(uploaded_text)
                 upload_preview_key = (
                     "quality_uploaded_preview_"
                     + hashlib.sha1(uploaded_doc.getvalue()).hexdigest()[:10]
                 )
                 st.text_area(
-                    "Extracted document text",
-                    value=uploaded_text,
+                    "Course Overview that will be evaluated",
+                    value=uploaded_overview,
                     height=260,
                     disabled=True,
                     key=upload_preview_key,
@@ -3462,9 +3451,9 @@ elif page == "🧭 Course Overview Quality":
             except Exception as exc:
                 st.error(str(exc))
         if st.button(
-            "🔍 Evaluate uploaded document",
+            "🔍 Evaluate uploaded overview",
             type="primary",
-            disabled=not uploaded_text.strip(),
+            disabled=not uploaded_overview.strip(),
             key="quality_evaluate_upload",
         ):
             context = (
@@ -3474,7 +3463,7 @@ elif page == "🧭 Course Overview Quality":
                 else f"Uploaded document: {uploaded_doc.name}"
             )
             evaluate_quality_input(
-                uploaded_text,
+                uploaded_overview,
                 context,
                 upload_name.strip() or uploaded_doc.name,
             )
@@ -3483,9 +3472,8 @@ elif page == "🧭 Course Overview Quality":
         st.divider()
         result = st.session_state["qr_result"]
         reviewed_text = st.session_state.get("qr_text", "")
-        source_label = st.session_state.get("qr_source_label", "Course content")
+        source_label = st.session_state.get("qr_source_label", "Course Overview")
         issues = result.get("issues", [])
-        claims = result.get("unverified_claims", [])
         metrics = content_metrics(reviewed_text)
 
         st.subheader(f"Quality result — {source_label}")
@@ -3495,16 +3483,14 @@ elif page == "🧭 Course Overview Quality":
         r1, r2, r3, r4 = st.columns(4)
         qr_stat(r1, f"{result.get('overall_score', 0)}%", "Overall quality", status_kind)
         qr_stat(r2, result.get("status", "—"), "Status", status_kind)
+        priority_count = sum(
+            1 for item in issues if item.get("severity") == "major"
+        )
         qr_stat(r3, len(issues), "Issues identified", "err" if issues else "ok")
-        qr_stat(r4, len(claims), "Claims to verify", "warn" if claims else "ok")
+        qr_stat(r4, priority_count, "Priority issues", "warn" if priority_count else "ok")
 
         if result.get("summary"):
             st.markdown(f"> {result['summary']}")
-        if result.get("human_review_required"):
-            st.warning(
-                "Human review is recommended, particularly for factual or promotional "
-                "claims that could not be verified from the supplied context."
-            )
 
         m1, m2, m3, m4 = st.columns(4)
         qr_stat(m1, metrics["word_count"], "Words", "info")
@@ -3532,27 +3518,19 @@ elif page == "🧭 Course Overview Quality":
                     st.caption("No specific strengths were returned.")
             with right:
                 st.markdown("#### Priority improvements")
-                priority = [i for i in issues if i.get("severity") in {"critical", "major"}]
+                priority = [i for i in issues if i.get("severity") == "major"]
                 priority = priority or issues[:5]
                 if priority:
                     for item in priority[:6]:
-                        label = QUALITY_CRITERIA[item["criterion"]]["label"]
+                        label = QUALITY_CRITERIA.get(
+                            item.get("criterion"), QUALITY_CRITERIA["language_accuracy"]
+                        )["label"]
                         st.markdown(
                             f"- **{item['severity'].title()} · {label}:** "
                             f"{item.get('explanation') or item.get('correction') or 'Review this wording.'}"
                         )
                 else:
                     st.success("No priority issues were identified.")
-
-            st.markdown("#### Unverified claims")
-            if claims:
-                for claim in claims:
-                    st.markdown(
-                        f"- **{claim.get('claim', 'Claim')}** — "
-                        f"{claim.get('reason', 'Requires verification.')}"
-                    )
-            else:
-                st.success("No unverified factual or promotional claims were flagged.")
 
         with result_scores:
             for key, meta in QUALITY_CRITERIA.items():
@@ -3561,8 +3539,7 @@ elif page == "🧭 Course Overview Quality":
                 explanation = html.escape(str(item.get("explanation") or ""))
                 st.markdown(
                     f'<div class="quality-score-row">'
-                    f'<div><div class="quality-score-label">{meta["label"]} '
-                    f'<span style="color:#829AB1;font-weight:600">({meta["weight"]}% weight)</span></div>'
+                    f'<div><div class="quality-score-label">{meta["label"]}</div>'
                     f'<div class="quality-score-explanation">{explanation}</div></div>'
                     f'<div class="quality-score-number" style="color:{meta["border"]}">{score}/100</div>'
                     f'</div>',
@@ -3614,13 +3591,13 @@ elif page == "🧭 Course Overview Quality":
         with result_rewrite:
             corrected = result.get("corrected_text") or reviewed_text
             st.caption(
-                "The improved version preserves the supplied meaning and should still "
-                "be checked against authoritative qualification information before publishing."
+                "The improved version preserves the supplied course facts and meaning while "
+                "addressing only the identified writing-quality issues."
             )
             if "quality_corrected_output" not in st.session_state:
                 st.session_state["quality_corrected_output"] = corrected
             st.text_area(
-                "Improved course content (copy-ready)",
+                "Improved Course Overview (copy-ready)",
                 height=360,
                 key="quality_corrected_output",
             )
@@ -3628,7 +3605,7 @@ elif page == "🧭 Course Overview Quality":
             st.download_button(
                 "⬇️ Download improved text",
                 st.session_state.get("quality_corrected_output", corrected),
-                file_name=f"{safe_name or 'course_content'}_improved.txt",
+                file_name=f"{safe_name or 'course_overview'}_improved.txt",
                 mime="text/plain",
                 key="quality_download_corrected",
             )

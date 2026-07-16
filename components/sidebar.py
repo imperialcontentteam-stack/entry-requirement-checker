@@ -46,7 +46,7 @@ def render(version: str, api_key_present: bool) -> str:
             <div class="sb-footer">
               <span class="version-pill">Version {version}</span><br>
               Compare course pages with qualification specifications, create
-              reports, proofread content, and evaluate course-overview quality from one workspace.
+              reports, proofread content, and review Course Overview writing quality from one workspace.
             </div>
             """,
             unsafe_allow_html=True,
