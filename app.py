@@ -42,6 +42,7 @@ import sqlite3
 import tempfile
 import threading
 import time
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, parse_qsl, urlencode, urlunparse
@@ -275,7 +276,7 @@ RED = "#DC2626"
 GREEN = "#16A34A"
 AMBER = "#D97706"
 
-APP_VERSION = "2.2.3"
+APP_VERSION = "2.2.4"
 EXTRACTION_VERSION = "2.0.3-pdf1"
 ENTRY_WORDING_VERSION = "2.1.4-relevant1"
 
@@ -2165,19 +2166,24 @@ PROOFREAD_SYSTEM = (
     "You reply ONLY with valid JSON."
 )
 
-PROOFREAD_PROMPT = """Proofread the text below. Find every issue and classify it into EXACTLY one of these categories:
+PROOFREAD_PROMPT = """Proofread the text below. Find every genuine error and classify it into EXACTLY one of these categories:
 grammar, article, spelling, punctuation, capitalisation, proper_noun, sentence_structure, consistency
 
 Rules:
+- Return ONLY genuine errors that require a textual change.
+- Do NOT return correct text, praise, observations, optional style preferences, or entries saying no change is needed.
+- If a phrase is already correct, omit it completely.
+- If there are no genuine errors, return an empty "issues" list.
 - "original" must be an EXACT substring copied verbatim from the text (short — the smallest span that contains the problem).
-- "correction" is the fixed version of that span.
-- "explanation" is one short sentence.
-- Also produce the fully corrected version of the whole text.
+- "correction" must be the fixed version of that span and must differ from "original".
+- "explanation" is one short sentence explaining the actual error.
+- Set "has_issue" to true for every returned issue.
+- Also produce the fully corrected version of the whole text. Do not make unlisted changes.
 
 Reply with EXACTLY this JSON:
 {{
   "issues": [
-    {{"category": "...", "original": "...", "correction": "...", "explanation": "..."}}
+    {{"has_issue": true, "category": "...", "original": "...", "correction": "...", "explanation": "..."}}
   ],
   "corrected_text": "..."
 }}
@@ -2187,8 +2193,107 @@ Reply with EXACTLY this JSON:
 """
 
 
+_NO_ISSUE_PHRASES = (
+    "no change needed",
+    "no changes needed",
+    "no correction needed",
+    "no correction required",
+    "no edit needed",
+    "already correct",
+    "is correct",
+    "correctly capitalised",
+    "correctly capitalized",
+    "no issue",
+    "not an issue",
+)
+
+
+def _normalise_proofread_span(value: object) -> str:
+    """Normalise invisible spacing without hiding real case or punctuation changes."""
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    text = text.replace("\u00a0", " ")
+    return " ".join(text.split()).strip()
+
+
+def _is_genuine_proofread_issue(issue: object, source_text: str) -> bool:
+    """Reject AI observations and no-op edits before they reach the UI or score."""
+    if not isinstance(issue, dict):
+        return False
+
+    # Newer prompt responses include this field, but remain compatible with
+    # earlier model responses that omit it.
+    if issue.get("has_issue") is False:
+        return False
+
+    category = str(issue.get("category", "")).strip()
+    original_raw = str(issue.get("original", ""))
+    correction_raw = str(issue.get("correction", ""))
+    explanation = _normalise_proofread_span(issue.get("explanation", "")).lower()
+
+    if category not in PROOFREAD_CATEGORIES:
+        return False
+    if not original_raw.strip() or not correction_raw.strip():
+        return False
+    if original_raw not in source_text:
+        return False
+
+    original = _normalise_proofread_span(original_raw)
+    correction = _normalise_proofread_span(correction_raw)
+    if not original or not correction or original == correction:
+        return False
+    if any(phrase in explanation for phrase in _NO_ISSUE_PHRASES):
+        return False
+    return True
+
+
+def _apply_proofread_corrections(source_text: str, issues: list[dict]) -> str:
+    """Build corrected copy using only validated issues, preventing silent edits."""
+    corrected = source_text
+    for issue in issues:
+        original = str(issue.get("original", ""))
+        replacement = str(issue.get("correction", ""))
+        if original and original in corrected:
+            corrected = corrected.replace(original, replacement, 1)
+    return corrected
+
+
+def normalise_proofreading_result(raw: object, source_text: str) -> dict:
+    """Sanitise the model response and remove duplicate or false-positive issues."""
+    raw = raw if isinstance(raw, dict) else {}
+    candidates = raw.get("issues", [])
+    if not isinstance(candidates, list):
+        candidates = []
+
+    issues: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in candidates:
+        if not _is_genuine_proofread_issue(item, source_text):
+            continue
+        cleaned = {
+            "category": str(item.get("category", "")).strip(),
+            "original": str(item.get("original", "")),
+            "correction": str(item.get("correction", "")),
+            "explanation": str(item.get("explanation", "")).strip(),
+        }
+        identity = (
+            cleaned["category"],
+            cleaned["original"],
+            cleaned["correction"],
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        issues.append(cleaned)
+
+    return {
+        "issues": issues,
+        "corrected_text": _apply_proofread_corrections(source_text, issues),
+    }
+
+
 def run_proofreading_review(text: str) -> dict:
-    return parse_json_reply(call_ai(PROOFREAD_PROMPT.format(text=text), PROOFREAD_SYSTEM))
+    raw = parse_json_reply(call_ai(PROOFREAD_PROMPT.format(text=text), PROOFREAD_SYSTEM))
+    return normalise_proofreading_result(raw, text)
 
 
 def annotate_proofreading_html(text: str, issues: list) -> str:
